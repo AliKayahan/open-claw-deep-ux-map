@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "target": {
+    "baseUrl": "https://app.example.com",
+    "loginUrl": "https://app.example.com/login",
+    "credentials": {
+      "email": "",
+      "password": ""
+    },
+    "otp": {
+      "enabled": true,
+      "mode": "manual",
+      "timeoutMs": 300000,
+      "inputSelectors": [
+        "input[name=\"token\"]",
+        "input[name=\"otp\"]",
+        "input[autocomplete=\"one-time-code\"]",
+        "input[inputmode=\"numeric\"]"
+      ],
+      "submitSelectors": [
+        "button[type=\"submit\"]",
+        "button:has-text(\"Verify\")",
+        "button:has-text(\"Continue\")"
+      ]
+    },
+    "loginSelectors": {
+      "email": [
+        "input[type=\"email\"]",
+        "input[name=\"email\"]",
+        "input[autocomplete=\"username\"]"
+      ],
+      "password": [
+        "input[type=\"password\"]",
+        "input[name=\"password\"]"
+      ],
+      "submit": [
+        "button[type=\"submit\"]",
+        "button:has-text(\"Sign in\")",
+        "button:has-text(\"Login\")"
+      ]
+    }
+  },
+  "browser": {
+    "headed": true,
+    "slowMoMs": 0,
+    "navigationTimeoutMs": 30000,
+    "actionTimeoutMs": 8000
+  },
+  "discovery": {
+    "maxStates": 120,
+    "maxDepth": 4,
+    "maxActionsPerState": 35,
+    "sameOriginOnly": true,
+    "includePaths": [
+      "/"
+    ],
+    "excludePaths": [
+      "/logout"
+    ]
+  },
+  "mapping": {
+    "concurrency": 2,
+    "maxJourneySteps": 30,
+    "waitAfterActionMs": 750,
+    "screenshot": true
+  },
+  "semantics": {
+    "minConfidence": 0.45
+  },
+  "safety": {
+    "allowDestructiveConfirm": true,
+    "alwaysTryCancelBranch": true,
+    "destructiveKeywords": [
+      "delete",
+      "remove",
+      "trash",
+      "archive",
+      "discard"
+    ],
+    "confirmTexts": [
+      "Delete",
+      "Remove",
+      "Confirm",
+      "Yes",
+      "Continue",
+      "Save"
+    ],
+    "cancelTexts": [
+      "Cancel",
+      "No",
+      "Keep",
+      "Close",
+      "Back"
+    ],
+    "skipActionTexts": [
+      "logout",
+      "sign out",
+      "quit"
+    ]
+  },
+  "artifacts": {
+    "root": "artifacts",
+    "learningsFile": "artifacts/learnings.md"
+  }
+}

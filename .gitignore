@@ -1,0 +1,6 @@
+node_modules/
+playwright-report/
+artifacts/browser/
+artifacts/runs/
+artifacts/tmp/
+.DS_Store

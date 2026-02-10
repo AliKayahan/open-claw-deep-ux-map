@@ -1,0 +1,17 @@
+{
+  "name": "openclaw-deep-ux-map",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "init": "node scripts/deep-ux-mapper.mjs init",
+    "validate-config": "node scripts/deep-ux-mapper.mjs validate-config",
+    "discover": "node scripts/deep-ux-mapper.mjs discover",
+    "map": "node scripts/deep-ux-mapper.mjs map",
+    "run": "node scripts/deep-ux-mapper.mjs run",
+    "status": "node scripts/deep-ux-mapper.mjs status"
+  },
+  "dependencies": {
+    "playwright": "^1.51.1"
+  }
+}

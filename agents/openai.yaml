@@ -1,0 +1,3 @@
+display_name: Deep UX Mapper
+short_description: Exhaustive semantic journey mapping with fresh-context runs and persistent learnings memory.
+default_prompt: Map a web platform end-to-end by auto-enumerating semantic journeys, replaying each in a fresh browser context, testing risky branches (Cancel and Confirm), and writing artifacts under artifacts/.
