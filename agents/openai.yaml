@@ -1,3 +1,4 @@
-display_name: Deep UX Mapper
-short_description: Exhaustive semantic journey mapping with fresh-context runs and persistent learnings memory.
-default_prompt: Map a web platform end-to-end by auto-enumerating semantic journeys, replaying each in a fresh browser context, testing risky branches (Cancel and Confirm), and writing artifacts under artifacts/.
+display_name: Deep Journey Mapper
+short_description: Platform-agnostic AI journey mapping with fresh AI context per journey and shared learnings.
+default_prompt: >-
+  Explore the target web platform like a curious expert user. Auto-discover semantic journeys, then execute each journey in a fresh AI context (new agent/subagent context per journey), sharing only persisted learnings between runs. Fill forms semantically, satisfy unlock gates (required fields, at least N items, step N of M), and continue through newly unlocked flows until completion. If chat/assistant surfaces exist, run meaningful multi-turn interactions and continue with unlocked actions. Test risky branches with both Cancel and Confirm where relevant. Emit progress after every completed journey with journeyName, depth, start, end, status, milestonesCompleted, gatesSatisfied, and blockedReason. Stay platform-agnostic and avoid domain-specific assumptions. Persist outputs under artifacts/.
