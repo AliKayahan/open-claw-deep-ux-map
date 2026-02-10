@@ -230,6 +230,7 @@ function pathsFromConfig(projectRoot, config) {
     features: path.join(root, 'features.json'),
     featuresMd: path.join(root, 'features.md'),
     featureEvents: path.join(root, 'feature-events.jsonl'),
+    journeyProgress: path.join(root, 'journey-progress.jsonl'),
     expectedVsFound: path.join(root, 'expected-vs-found.json'),
     expectedVsFoundMd: path.join(root, 'expected-vs-found.md'),
     coverageFrontier: path.join(root, 'coverage-frontier.json'),
@@ -349,6 +350,7 @@ function initializeWorkspace(paths, configPath, config) {
   ensureFile(paths.edges, '');
   ensureFile(paths.journeyCandidates, '');
   ensureFile(paths.featureEvents, '');
+  ensureFile(paths.journeyProgress, '');
   ensureFile(paths.routeUniverse, `${JSON.stringify(createRouteUniverse(), null, 2)}\n`);
   ensureFile(paths.entityRegistry, `${JSON.stringify(createEntityRegistry(), null, 2)}\n`);
   ensureFile(paths.journeyGraph, `${JSON.stringify({ version: 2, nodes: [], edges: [] }, null, 2)}\n`);
@@ -1464,7 +1466,7 @@ async function executeJourney(browser, config, paths, journey, shared) {
   };
 }
 
-async function runInPool(items, concurrency, worker) {
+async function runInPool(items, concurrency, worker, onResult = null) {
   const queue = [...items];
   const results = [];
 
@@ -1476,6 +1478,9 @@ async function runInPool(items, concurrency, worker) {
       }
       const output = await worker(item);
       results.push(output);
+      if (onResult) {
+        await onResult(item, output);
+      }
     }
   });
 
@@ -1504,6 +1509,33 @@ async function runJourneyMapping(config, paths) {
   const pending = [...journeys];
   const results = [];
   let safetyIterations = 0;
+  let completedReportCount = 0;
+
+  const emitJourneyProgress = (journey, result) => {
+    completedReportCount += 1;
+
+    const startPoint = journey.entryTemplate || journey.entryUrl || '';
+    const endPoint = journey.targetTemplate || journey.targetUrl || '';
+    const depth = safeArray(journey.steps).length;
+
+    const event = {
+      at: nowIso(),
+      type: 'journey-complete',
+      sequence: completedReportCount,
+      totalJourneys: journeys.length,
+      journeyId: journey.id,
+      journeyName: journey.name,
+      status: result.status,
+      depth,
+      completedSteps: result.completedSteps || 0,
+      start: startPoint,
+      end: endPoint,
+      missingEntities: safeArray(result.missingEntities)
+    };
+
+    appendJsonl(paths.journeyProgress, event);
+    console.log(JSON.stringify(event, null, 2));
+  };
 
   while (pending.length > 0 && safetyIterations < 200) {
     safetyIterations += 1;
@@ -1512,22 +1544,27 @@ async function runJourneyMapping(config, paths) {
 
     if (ready.length === 0) {
       for (const journey of pending) {
-        results.push({
+        const blockedResult = {
           journeyId: journey.id,
           status: 'blocked',
           completedSteps: 0,
           localFeatures: [],
           branchFindings: [],
           missingEntities: missingEntitiesForJourney(journey, shared.entityRegistry)
-        });
+        };
+        results.push(blockedResult);
+        emitJourneyProgress(journey, blockedResult);
       }
       break;
     }
 
     const batch = ready.slice(0, Math.max(1, config.mapping.concurrency));
-    const batchResults = await runInPool(batch, config.mapping.concurrency, (journey) => {
-      return executeJourney(browser, config, paths, journey, shared);
-    });
+    const batchResults = await runInPool(
+      batch,
+      config.mapping.concurrency,
+      (journey) => executeJourney(browser, config, paths, journey, shared),
+      (journey, result) => emitJourneyProgress(journey, result)
+    );
 
     results.push(...batchResults);
 
@@ -1673,7 +1710,8 @@ function statusSummary(paths) {
       e2eSpecs: paths.e2eSpecs,
       smokeSuite: paths.smokeSuite,
       copyInventory: paths.copyInventory,
-      copyIssues: paths.copyIssues
+      copyIssues: paths.copyIssues,
+      journeyProgress: paths.journeyProgress
     }
   };
 

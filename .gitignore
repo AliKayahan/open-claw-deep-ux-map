@@ -11,4 +11,5 @@ artifacts/e2e-specs.json
 artifacts/smoke-suite.json
 artifacts/copy-inventory.json
 artifacts/copy-issues.json
+artifacts/journey-progress.jsonl
 .DS_Store

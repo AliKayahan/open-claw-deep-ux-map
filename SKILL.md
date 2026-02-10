@@ -25,7 +25,8 @@ Use for requests like:
 5. Replay each journey in a fresh context to avoid context bloat.
 6. For destructive actions, test both modal branches (`Cancel`, then `Confirm`) when enabled.
 7. Persist cross-run memory in `artifacts/learnings.md` with file-lock-safe append logic.
-8. Output structured maps for journey analysis and test generation.
+8. Emit per-journey completion updates with name, depth, start, and end (stdout + `artifacts/journey-progress.jsonl`).
+9. Output structured maps for journey analysis and test generation.
 
 ## Execution steps
 

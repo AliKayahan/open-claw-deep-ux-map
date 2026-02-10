@@ -15,6 +15,7 @@ It is designed for:
 - Runtime entity registry that captures generated IDs and reuses them in dependent routes.
 - Route universe + dependency-aware journey ordering (journeys that need IDs wait until producers run).
 - Branch handling for destructive actions: `Cancel` then `Confirm` (when enabled).
+- Real-time per-journey progress events (stdout + `journey-progress.jsonl`) with name, depth, start, end, and status.
 - Persistent cross-run learning in `artifacts/learnings.md`.
 
 ## Install
@@ -75,6 +76,7 @@ Core outputs:
 - `e2e-specs.json`: generated test-ready journey specs
 - `smoke-suite.json`: prioritized smoke checks
 - `copy-inventory.json` + `copy-issues.json`: UX copy inventory and issue hints
+- `journey-progress.jsonl`: append-only per-journey completion events for live monitoring
 - `expected-vs-found.json` / `expected-vs-found.md`: inferred capability gaps
 - `coverage-frontier.json`: mapping progress + route coverage against target
 - `learnings.md`: append-only cross-run memory
