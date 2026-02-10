@@ -1,6 +1,6 @@
 ---
 name: deep-ux-map
-description: Use this skill when you need exhaustive platform-agnostic UX mapping that auto-discovers semantic journeys, runs each journey in fresh browser context, tests both cancel/confirm destructive branches, and persists cross-run learnings in learnings.md.
+description: Use this skill when you need exhaustive platform-agnostic UX mapping that auto-discovers semantic journeys, handles generated ID dependencies, runs each journey in fresh browser context, tests cancel/confirm destructive branches, and persists cross-run learnings.
 ---
 
 # Deep UX Map Skill
@@ -20,10 +20,12 @@ Use for requests like:
 
 1. Automatically build an interaction graph from UI states and actions.
 2. Infer semantic journeys from action text, icon hints, route structure, and network mutations.
-3. Replay each journey in a fresh context to avoid context bloat.
-4. For destructive actions, test both modal branches (`Cancel`, then `Confirm`) when enabled.
-5. Persist cross-run memory in `artifacts/learnings.md` with file-lock-safe append logic.
-6. Output structured maps (`journeys`, `features`, `expected-vs-found`, `coverage-frontier`).
+3. Capture runtime entity values (`userId`, `workspaceId`, `specificationId`, etc.) from URLs and API JSON.
+4. Resolve templated routes using captured entities and defer blocked journeys until dependencies are produced.
+5. Replay each journey in a fresh context to avoid context bloat.
+6. For destructive actions, test both modal branches (`Cancel`, then `Confirm`) when enabled.
+7. Persist cross-run memory in `artifacts/learnings.md` with file-lock-safe append logic.
+8. Output structured maps for journey analysis and test generation.
 
 ## Execution steps
 
@@ -38,6 +40,8 @@ Use for requests like:
 - `discovery.maxStates`: how deep/wide initial graph scan goes
 - `discovery.maxDepth`: depth of queued route expansion
 - `mapping.concurrency`: number of fresh-context journey workers
+- `contexts`: guest/auth context definitions and seeds
+- `coverage.targetPct`: target route coverage percentage
 - `safety.allowDestructiveConfirm`: whether confirm branch is executed
 - `semantics.minConfidence`: threshold for accepting semantic candidates
 
@@ -45,6 +49,10 @@ Use for requests like:
 
 - `artifacts/journeys.md`
 - `artifacts/features.md`
+- `artifacts/journey-graph.json`
+- `artifacts/entity-registry.json`
+- `artifacts/e2e-specs.json`
+- `artifacts/smoke-suite.json`
 - `artifacts/expected-vs-found.md`
 - `artifacts/learnings.md`
 

@@ -1,38 +1,45 @@
 # Deep UX Mapper (Open Claw Skill)
 
-Platform-agnostic browser mapping flow that:
+Platform/source-code agnostic deep journey mapper for web platforms.
 
-- auto-discovers semantic journeys (auth/account/CRUD/settings/collaboration patterns)
-- replays each journey in a fresh browser context
-- learns from UI copy, icons, and network mutations
-- infers expected sibling capabilities (`create -> view/update/delete`)
-- tests destructive branches with both `Cancel` and `Confirm`
-- persists cross-run memory in `artifacts/learnings.md`
+It is designed for:
 
-## Why this avoids premature stopping
+- route/journey coverage beyond simple nav clicking
+- query-param and ID-dependent routes (`userId`, `workspaceId`, `specificationId`, etc.)
+- reusable artifacts for E2E generation, smoke testing, critical-path analysis, and copy audits
 
-Instead of one long context-heavy session, this flow writes incremental state to disk and isolates execution by journey. That makes deep mapping resilient to context resets and long runtime.
+## What changed in v2
+
+- Automatic semantic journey enumeration from runtime behavior (UI + network).
+- Fresh Playwright context per journey to avoid long-session context collapse.
+- Runtime entity registry that captures generated IDs and reuses them in dependent routes.
+- Route universe + dependency-aware journey ordering (journeys that need IDs wait until producers run).
+- Branch handling for destructive actions: `Cancel` then `Confirm` (when enabled).
+- Persistent cross-run learning in `artifacts/learnings.md`.
 
 ## Install
 
 ```bash
 cd "/Users/ali/Desktop/Layer0/Open Claw/deep-ux-map"
 npm install
+npx playwright install chromium
 ```
 
 ## Configure target
 
-Edit:
+Edit `/Users/ali/Desktop/Layer0/Open Claw/deep-ux-map/docs/orchestration.config.json`.
 
-- `/Users/ali/Desktop/Layer0/Open Claw/deep-ux-map/docs/orchestration.config.json`
-
-Required:
+Minimum required:
 
 - `target.baseUrl`
-- `target.loginUrl` (if auth is needed)
-- `target.credentials.email/password` (for authenticated apps)
+- `target.loginUrl` for authenticated apps
+- `target.credentials.email/password` when auth context is enabled
 
-For OTP flows, keep `target.otp.enabled=true` and complete OTP in the headed browser when prompted.
+Recommended:
+
+- tune `contexts` to include guest/auth entry points
+- keep OTP enabled for email-code login flows
+- raise `discovery.maxStates` and `discovery.maxDepth` for deeper maps
 
 ## Commands
 
@@ -45,7 +52,7 @@ npm run run
 npm run status
 ```
 
-## Recommended run
+## Typical run
 
 ```bash
 npm run validate-config
@@ -53,35 +60,29 @@ npm run run
 npm run status
 ```
 
-## Output artifacts
+## Artifacts
 
-All outputs are under:
+All outputs are under `/Users/ali/Desktop/Layer0/Open Claw/deep-ux-map/artifacts`.
 
-- `/Users/ali/Desktop/Layer0/Open Claw/deep-ux-map/artifacts`
+Core outputs:
 
-Key files:
+- `journeys.json` / `journeys.md`: semantic journey catalog
+- `features.json` / `features.md`: discovered feature interactions
+- `route-universe.json`: observed route templates and coverage states
+- `entity-registry.json`: generated IDs/tokens captured from URL + API payloads
+- `journey-graph.json`: journey dependency graph + unresolved entities
+- `critical-paths.json`: ranked high-value paths
+- `e2e-specs.json`: generated test-ready journey specs
+- `smoke-suite.json`: prioritized smoke checks
+- `copy-inventory.json` + `copy-issues.json`: UX copy inventory and issue hints
+- `expected-vs-found.json` / `expected-vs-found.md`: inferred capability gaps
+- `coverage-frontier.json`: mapping progress + route coverage against target
+- `learnings.md`: append-only cross-run memory
 
-- `learnings.md`: append-only memory across fresh-context and async runs
-- `journeys.json` + `journeys.md`: auto-enumerated semantic journey catalog
-- `features.json` + `features.md`: discovered interaction-level features
-- `expected-vs-found.json` + `expected-vs-found.md`: inferred capability gaps
-- `coverage-frontier.json`: progress summary
-- `graph-edges.jsonl`: raw transition graph
-- `runs/*`: per-run screenshots and event logs
+## Safety
 
-## Safety note
+`safety.allowDestructiveConfirm=true` executes destructive confirm actions. Use only in test/staging accounts.
 
-`allowDestructiveConfirm=true` executes confirm branch in destructive flows. Use only on test/staging environments or test accounts.
+## Why this avoids premature stopping
 
-## Journey model
-
-A journey candidate is auto-generated from observed transitions where semantic confidence passes threshold (`semantics.minConfidence`) and includes:
-
-- intent (`login`, `register`, `create`, `update`, `delete`, etc.)
-- entity (`account`, `spec`, `project`, etc.)
-- replayable step trail
-- completion signals (URL change, state fingerprint change, mutation calls)
-
-## Fresh-context behavior
-
-During `map`, each journey runs in a new Playwright context. This keeps runs independent and supports parallel execution (`mapping.concurrency`).
+This flow does not rely on one long conversational/browser session. It stores discovered graph/entity state to disk and replays journeys independently, which is resilient against context resets and long-run token pressure.

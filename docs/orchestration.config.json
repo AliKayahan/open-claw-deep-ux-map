@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "target": {
     "baseUrl": "https://app.example.com",
     "loginUrl": "https://app.example.com/login",
@@ -40,6 +40,27 @@
       ]
     }
   },
+  "contexts": [
+    {
+      "name": "guest",
+      "auth": false,
+      "seedPaths": [
+        "/",
+        "/auth/sign-in",
+        "/share",
+        "/invite",
+        "/workspace-invite"
+      ]
+    },
+    {
+      "name": "auth",
+      "auth": true,
+      "seedPaths": [
+        "/",
+        "/dashboard"
+      ]
+    }
+  ],
   "browser": {
     "headed": true,
     "slowMoMs": 0,
@@ -47,9 +68,9 @@
     "actionTimeoutMs": 8000
   },
   "discovery": {
-    "maxStates": 120,
-    "maxDepth": 4,
-    "maxActionsPerState": 35,
+    "maxStates": 220,
+    "maxDepth": 5,
+    "maxActionsPerState": 45,
     "sameOriginOnly": true,
     "includePaths": [
       "/"
@@ -60,12 +81,17 @@
   },
   "mapping": {
     "concurrency": 2,
-    "maxJourneySteps": 30,
-    "waitAfterActionMs": 750,
+    "maxJourneySteps": 40,
+    "waitAfterActionMs": 900,
     "screenshot": true
   },
   "semantics": {
     "minConfidence": 0.45
+  },
+  "coverage": {
+    "mode": "agnostic-runtime",
+    "targetPct": 95,
+    "stagnationRounds": 3
   },
   "safety": {
     "allowDestructiveConfirm": true,

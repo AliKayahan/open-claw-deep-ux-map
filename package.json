@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "setup": "npm install && npx playwright install chromium",
     "init": "node scripts/deep-ux-mapper.mjs init",
     "validate-config": "node scripts/deep-ux-mapper.mjs validate-config",
     "discover": "node scripts/deep-ux-mapper.mjs discover",

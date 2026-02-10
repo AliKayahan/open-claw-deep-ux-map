@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "createdAt": "2026-02-10T15:09:29.841Z",
   "lastRunAt": "2026-02-10T15:10:05.644Z",
   "lastCommand": "init",
@@ -7,11 +7,14 @@
     "completedAt": null,
     "stateCount": 0,
     "edgeCount": 0,
-    "candidateJourneyCount": 0
+    "candidateJourneyCount": 0,
+    "routeCoveragePct": 0
   },
   "mapping": {
     "completedAt": null,
     "completedJourneyCount": 0,
-    "failedJourneyCount": 0
+    "failedJourneyCount": 0,
+    "blockedJourneyCount": 0,
+    "routeCoveragePct": 0
   }
 }

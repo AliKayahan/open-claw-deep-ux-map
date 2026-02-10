@@ -14,7 +14,6 @@ import {
   normalizeText,
   readJson,
   safeArray,
-  sleep,
   slugify,
   writeJson
 } from './lib/fs-utils.mjs';
@@ -41,9 +40,29 @@ import {
   renderFeatureMarkdown,
   renderJourneyMarkdown
 } from './lib/markdown-utils.mjs';
+import {
+  addCopyEntry,
+  buildJourneyDependencyGraph,
+  buildRouteCoverage,
+  createCopyInventory,
+  createEntityRegistry,
+  createRouteUniverse,
+  extractEntityValuesFromObject,
+  extractEntityValuesFromUrl,
+  resolveTemplateUrl,
+  routeTemplateFromUrl,
+  upsertEntityValues,
+  upsertRouteObservation
+} from './lib/route-intelligence.mjs';
+import {
+  buildCopyIssueHints,
+  buildCriticalPaths,
+  buildE2ESpecs,
+  buildSmokeSuite
+} from './lib/artifact-builders.mjs';
 
 const DEFAULT_CONFIG = {
-  version: 1,
+  version: 2,
   target: {
     baseUrl: 'https://app.example.com',
     loginUrl: 'https://app.example.com/login',
@@ -69,6 +88,18 @@ const DEFAULT_CONFIG = {
       submit: ['button[type="submit"]', 'button:has-text("Sign in")', 'button:has-text("Login")']
     }
   },
+  contexts: [
+    {
+      name: 'guest',
+      auth: false,
+      seedPaths: ['/', '/auth/sign-in', '/share', '/invite', '/workspace-invite']
+    },
+    {
+      name: 'auth',
+      auth: true,
+      seedPaths: ['/', '/dashboard']
+    }
+  ],
   browser: {
     headed: true,
     slowMoMs: 0,
@@ -76,21 +107,26 @@ const DEFAULT_CONFIG = {
     actionTimeoutMs: 8_000
   },
   discovery: {
-    maxStates: 120,
-    maxDepth: 4,
-    maxActionsPerState: 35,
+    maxStates: 220,
+    maxDepth: 5,
+    maxActionsPerState: 45,
     sameOriginOnly: true,
     includePaths: ['/'],
     excludePaths: ['/logout']
   },
   mapping: {
     concurrency: 2,
-    maxJourneySteps: 30,
-    waitAfterActionMs: 750,
+    maxJourneySteps: 40,
+    waitAfterActionMs: 900,
     screenshot: true
   },
   semantics: {
     minConfidence: 0.45
+  },
+  coverage: {
+    mode: 'agnostic-runtime',
+    targetPct: 95,
+    stagnationRounds: 3
   },
   safety: {
     allowDestructiveConfirm: true,
@@ -107,7 +143,7 @@ const DEFAULT_CONFIG = {
 };
 
 const DEFAULT_STATE = {
-  version: 1,
+  version: 2,
   createdAt: nowIso(),
   lastRunAt: null,
   lastCommand: null,
@@ -115,14 +151,34 @@ const DEFAULT_STATE = {
     completedAt: null,
     stateCount: 0,
     edgeCount: 0,
-    candidateJourneyCount: 0
+    candidateJourneyCount: 0,
+    routeCoveragePct: 0
   },
   mapping: {
     completedAt: null,
     completedJourneyCount: 0,
-    failedJourneyCount: 0
+    failedJourneyCount: 0,
+    blockedJourneyCount: 0,
+    routeCoveragePct: 0
   }
 };
+
+function normalizeStateShape(inputState) {
+  const state = inputState || {};
+  return {
+    ...DEFAULT_STATE,
+    ...state,
+    version: 2,
+    discovery: {
+      ...DEFAULT_STATE.discovery,
+      ...(state.discovery || {})
+    },
+    mapping: {
+      ...DEFAULT_STATE.mapping,
+      ...(state.mapping || {})
+    }
+  };
+}
 
 function parseArgs(argv) {
   const result = {
@@ -178,7 +234,15 @@ function pathsFromConfig(projectRoot, config) {
     expectedVsFoundMd: path.join(root, 'expected-vs-found.md'),
     coverageFrontier: path.join(root, 'coverage-frontier.json'),
     authState: path.join(root, 'auth-storage-state.json'),
-    runs: path.join(root, 'runs')
+    runs: path.join(root, 'runs'),
+    routeUniverse: path.join(root, 'route-universe.json'),
+    entityRegistry: path.join(root, 'entity-registry.json'),
+    journeyGraph: path.join(root, 'journey-graph.json'),
+    criticalPaths: path.join(root, 'critical-paths.json'),
+    e2eSpecs: path.join(root, 'e2e-specs.json'),
+    smokeSuite: path.join(root, 'smoke-suite.json'),
+    copyInventory: path.join(root, 'copy-inventory.json'),
+    copyIssues: path.join(root, 'copy-issues.json')
   };
 }
 
@@ -209,6 +273,7 @@ function loadConfig(configPath) {
         ...(loaded.target?.loginSelectors || {})
       }
     },
+    contexts: safeArray(loaded.contexts).length > 0 ? loaded.contexts : DEFAULT_CONFIG.contexts,
     browser: {
       ...DEFAULT_CONFIG.browser,
       ...(loaded.browser || {})
@@ -224,6 +289,10 @@ function loadConfig(configPath) {
     semantics: {
       ...DEFAULT_CONFIG.semantics,
       ...(loaded.semantics || {})
+    },
+    coverage: {
+      ...DEFAULT_CONFIG.coverage,
+      ...(loaded.coverage || {})
     },
     safety: {
       ...DEFAULT_CONFIG.safety,
@@ -259,6 +328,10 @@ function validateConfig(config) {
     errors.push('mapping.concurrency must be > 0');
   }
 
+  if (Number(config.coverage.targetPct) <= 0 || Number(config.coverage.targetPct) > 100) {
+    errors.push('coverage.targetPct must be > 0 and <= 100');
+  }
+
   return errors;
 }
 
@@ -269,14 +342,25 @@ function initializeWorkspace(paths, configPath, config) {
 
   ensureFile(paths.state, `${JSON.stringify(DEFAULT_STATE, null, 2)}\n`);
   ensureFile(paths.knowledge, `${JSON.stringify(createKnowledgeBase(), null, 2)}\n`);
-  ensureFile(paths.journeys, `${JSON.stringify({ version: 1, journeys: [] }, null, 2)}\n`);
-  ensureFile(paths.features, `${JSON.stringify({ version: 1, features: [] }, null, 2)}\n`);
-  ensureFile(paths.expectedVsFound, `${JSON.stringify({ version: 1, entities: [] }, null, 2)}\n`);
-  ensureFile(paths.coverageFrontier, `${JSON.stringify({ version: 1 }, null, 2)}\n`);
+  ensureFile(paths.journeys, `${JSON.stringify({ version: 2, journeys: [] }, null, 2)}\n`);
+  ensureFile(paths.features, `${JSON.stringify({ version: 2, features: [] }, null, 2)}\n`);
+  ensureFile(paths.expectedVsFound, `${JSON.stringify({ version: 2, entities: [] }, null, 2)}\n`);
+  ensureFile(paths.coverageFrontier, `${JSON.stringify({ version: 2 }, null, 2)}\n`);
   ensureFile(paths.edges, '');
   ensureFile(paths.journeyCandidates, '');
   ensureFile(paths.featureEvents, '');
+  ensureFile(paths.routeUniverse, `${JSON.stringify(createRouteUniverse(), null, 2)}\n`);
+  ensureFile(paths.entityRegistry, `${JSON.stringify(createEntityRegistry(), null, 2)}\n`);
+  ensureFile(paths.journeyGraph, `${JSON.stringify({ version: 2, nodes: [], edges: [] }, null, 2)}\n`);
+  ensureFile(paths.criticalPaths, `${JSON.stringify({ version: 2, entries: [] }, null, 2)}\n`);
+  ensureFile(paths.e2eSpecs, `${JSON.stringify({ version: 2, specs: [] }, null, 2)}\n`);
+  ensureFile(paths.smokeSuite, `${JSON.stringify({ version: 2, cases: [] }, null, 2)}\n`);
+  ensureFile(paths.copyInventory, `${JSON.stringify(createCopyInventory(), null, 2)}\n`);
+  ensureFile(paths.copyIssues, `${JSON.stringify({ version: 2, hints: [] }, null, 2)}\n`);
   ensureLearningsFile(paths.learnings);
+
+  const migratedState = normalizeStateShape(readJson(paths.state, DEFAULT_STATE));
+  writeJson(paths.state, migratedState);
 
   if (!fs.existsSync(configPath)) {
     writeJson(configPath, config);
@@ -284,7 +368,7 @@ function initializeWorkspace(paths, configPath, config) {
 }
 
 function updateState(paths, patch) {
-  const current = readJson(paths.state, DEFAULT_STATE);
+  const current = normalizeStateShape(readJson(paths.state, DEFAULT_STATE));
   const next = {
     ...current,
     ...patch,
@@ -318,14 +402,13 @@ async function firstVisibleLocator(page, selectors = []) {
         return locator;
       }
     } catch {
-      // continue
+      // keep trying
     }
   }
   return null;
 }
 
 async function runLoginIfNeeded(page, config, logPrefix = '[auth]') {
-  const currentUrl = page.url();
   const loginUrl = config.target.loginUrl || config.target.baseUrl;
 
   await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: config.browser.navigationTimeoutMs });
@@ -371,13 +454,6 @@ async function runLoginIfNeeded(page, config, logPrefix = '[auth]') {
       }
     }
   }
-
-  if (currentUrl && currentUrl !== 'about:blank') {
-    await page.goto(config.target.baseUrl, {
-      waitUntil: 'domcontentloaded',
-      timeout: config.browser.navigationTimeoutMs
-    });
-  }
 }
 
 async function ensureAuthStorageState(browser, config, paths) {
@@ -399,25 +475,64 @@ async function ensureAuthStorageState(browser, config, paths) {
   return paths.authState;
 }
 
-async function locateAction(page, action) {
-  const selector = action.selector;
-  if (!selector) {
-    return null;
+async function openContext(browser, contextDef, paths) {
+  if (contextDef.auth && fs.existsSync(paths.authState)) {
+    return browser.newContext({ storageState: paths.authState });
   }
-
-  const locator = page.locator(selector).first();
-  try {
-    const visible = await locator.isVisible();
-    if (!visible) {
-      return null;
-    }
-    return locator;
-  } catch {
-    return null;
-  }
+  return browser.newContext();
 }
 
-async function selectAlternateValue(page, locator) {
+function shouldQueueUrl(url, baseUrl, config) {
+  if (!url) {
+    return false;
+  }
+
+  if (config.discovery.sameOriginOnly && !sameOrigin(url, baseUrl)) {
+    return false;
+  }
+
+  const route = routeFromUrl(url);
+  if (safeArray(config.discovery.excludePaths).some((prefix) => route.startsWith(prefix))) {
+    return false;
+  }
+
+  if (!safeArray(config.discovery.includePaths).length) {
+    return true;
+  }
+
+  return safeArray(config.discovery.includePaths).some((prefix) => route.startsWith(prefix));
+}
+
+function shouldSkipByText(action, config) {
+  const text = normalizeText(`${action.text} ${action.ariaLabel} ${action.title}`);
+  return safeArray(config.safety.skipActionTexts).some((item) => text.includes(normalizeText(item)));
+}
+
+async function locateAction(page, action) {
+  if (action.selector) {
+    const bySelector = page.locator(action.selector).first();
+    if (await bySelector.isVisible().catch(() => false)) {
+      return bySelector;
+    }
+  }
+
+  const labels = [action.text, action.ariaLabel, action.title].filter(Boolean);
+  for (const label of labels) {
+    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const byButtonText = page
+      .locator('button, [role="button"], a, [role="menuitem"], [role="tab"]')
+      .filter({ hasText: new RegExp(escaped, 'i') })
+      .first();
+
+    if (await byButtonText.isVisible().catch(() => false)) {
+      return byButtonText;
+    }
+  }
+
+  return null;
+}
+
+async function selectAlternateValue(locator) {
   const values = await locator.evaluate((node) => {
     if (!(node instanceof HTMLSelectElement)) {
       return [];
@@ -436,11 +551,6 @@ async function selectAlternateValue(page, locator) {
   return true;
 }
 
-function shouldSkipByText(action, config) {
-  const text = normalizeText(`${action.text} ${action.ariaLabel} ${action.title}`);
-  return (config.safety.skipActionTexts || []).some((item) => text.includes(normalizeText(item)));
-}
-
 async function performAction(page, action, config) {
   const locator = await locateAction(page, action);
   if (!locator) {
@@ -452,7 +562,7 @@ async function performAction(page, action, config) {
   }
 
   if (action.tagName === 'select') {
-    const switched = await selectAlternateValue(page, locator);
+    const switched = await selectAlternateValue(locator);
     return switched
       ? { performed: true, kind: 'select', reason: 'selected-alternate-option' }
       : { performed: false, reason: 'select-no-options' };
@@ -480,25 +590,80 @@ async function captureScreenshotIfEnabled(page, config, outputDir, prefix, url, 
   return fullPath;
 }
 
-function shouldQueueUrl(url, baseUrl, config) {
-  if (!url) {
-    return false;
+async function collectNetworkEntityValues(page, actionRunner, waitMs) {
+  const mutationRequests = [];
+  const entityPayloads = [];
+  const responseTasks = [];
+
+  const requestListener = (request) => {
+    const method = request.method();
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+      mutationRequests.push({
+        at: nowIso(),
+        method,
+        url: request.url()
+      });
+    }
+  };
+
+  const responseListener = (response) => {
+    const req = response.request();
+    const type = req.resourceType();
+    if (!['xhr', 'fetch'].includes(type)) {
+      return;
+    }
+
+    const task = (async () => {
+      try {
+        const contentType = response.headers()['content-type'] || '';
+        if (!/json/i.test(contentType)) {
+          return;
+        }
+        const json = await response.json();
+        const entities = extractEntityValuesFromObject(json, { maxDepth: 6 });
+        if (Object.keys(entities).length > 0) {
+          entityPayloads.push({
+            url: response.url(),
+            status: response.status(),
+            entities
+          });
+        }
+      } catch {
+        // Ignore parse failures.
+      }
+    })();
+
+    responseTasks.push(task);
+  };
+
+  page.on('requestfinished', requestListener);
+  page.on('response', responseListener);
+
+  try {
+    const actionResult = await actionRunner();
+    await page.waitForTimeout(waitMs);
+    await Promise.allSettled(responseTasks);
+    return { actionResult, mutationRequests, entityPayloads };
+  } finally {
+    page.off('requestfinished', requestListener);
+    page.off('response', responseListener);
+  }
+}
+
+function deriveProducedEntityKeys(beforeValues, afterValues) {
+  const keys = new Set();
+
+  for (const [key, value] of Object.entries(afterValues || {})) {
+    if (!value) {
+      continue;
+    }
+
+    if (!beforeValues[key] || String(beforeValues[key]) !== String(value)) {
+      keys.add(key);
+    }
   }
 
-  if (config.discovery.sameOriginOnly && !sameOrigin(url, baseUrl)) {
-    return false;
-  }
-
-  const route = routeFromUrl(url);
-  if (safeArray(config.discovery.excludePaths).some((prefix) => route.startsWith(prefix))) {
-    return false;
-  }
-
-  if (!safeArray(config.discovery.includePaths).length) {
-    return true;
-  }
-
-  return safeArray(config.discovery.includePaths).some((prefix) => route.startsWith(prefix));
+  return Array.from(keys).sort();
 }
 
 async function probeActionTransition(params) {
@@ -509,32 +674,30 @@ async function probeActionTransition(params) {
     action,
     config,
     runOutputDir,
-    minConfidence
+    minConfidence,
+    contextName
   } = params;
 
   const startedAt = Date.now();
-  const networkMutations = [];
-
-  const requestListener = (request) => {
-    const method = request.method();
-    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
-      networkMutations.push({
-        at: nowIso(),
-        method,
-        url: request.url()
-      });
-    }
-  };
-
-  page.on('requestfinished', requestListener);
+  const beforeEntities = extractEntityValuesFromUrl(beforeState.url);
 
   let actionResult;
   let afterState;
   let screenshot;
+  let mutationRequests = [];
+  let entityPayloads = [];
 
   try {
-    actionResult = await performAction(page, action, config);
-    await page.waitForTimeout(config.mapping.waitAfterActionMs);
+    const networkOutcome = await collectNetworkEntityValues(
+      page,
+      () => performAction(page, action, config),
+      config.mapping.waitAfterActionMs
+    );
+
+    actionResult = networkOutcome.actionResult;
+    mutationRequests = networkOutcome.mutationRequests;
+    entityPayloads = networkOutcome.entityPayloads;
+
     afterState = await capturePageState(page);
 
     if (actionResult.performed) {
@@ -550,37 +713,58 @@ async function probeActionTransition(params) {
   } catch (error) {
     actionResult = { performed: false, reason: `error:${error.message}` };
     afterState = await capturePageState(page).catch(() => beforeState);
-  } finally {
-    page.off('requestfinished', requestListener);
   }
 
-  const classification = classifyAction(action, beforeState, { networkMutations });
+  const afterEntities = {
+    ...extractEntityValuesFromUrl(afterState.url)
+  };
+
+  for (const payload of entityPayloads) {
+    Object.assign(afterEntities, payload.entities);
+  }
+
+  const producedEntityKeys = deriveProducedEntityKeys(beforeEntities, afterEntities);
+
+  const classification = classifyAction(action, beforeState, { networkMutations: mutationRequests });
   const changed =
     actionResult.performed &&
-    (beforeState.fingerprint !== afterState.fingerprint || beforeState.url !== afterState.url || networkMutations.length > 0);
+    (beforeState.fingerprint !== afterState.fingerprint || beforeState.url !== afterState.url || mutationRequests.length > 0);
+
+  const fromTemplate = routeTemplateFromUrl(beforeState.url);
+  const toTemplate = routeTemplateFromUrl(afterState.url);
 
   const edge = {
-    id: `edge-${slugify(`${beforeState.url}-${action.selector}-${Date.now()}`)}`,
+    id: `edge-${slugify(`${beforeState.url}-${action.selector || action.text}-${Date.now()}`)}`,
     observedAt: nowIso(),
     durationMs: Date.now() - startedAt,
+    context: contextName,
     from: {
       url: beforeState.url,
+      routeTemplate: fromTemplate.template,
+      requiredEntities: fromTemplate.requiredEntities,
       fingerprint: beforeState.fingerprint,
       route: routeFromUrl(beforeState.url)
     },
     to: {
       url: afterState.url,
+      routeTemplate: toTemplate.template,
+      requiredEntities: toTemplate.requiredEntities,
       fingerprint: afterState.fingerprint,
       route: routeFromUrl(afterState.url)
     },
     action,
     actionResult,
     semantic: classification,
-    networkMutations,
+    networkMutations: mutationRequests,
+    networkEntityPayloads: entityPayloads,
+    extractedEntities: afterEntities,
+    producedEntityKeys,
     changed,
     screenshot,
     trail: [...safeArray(stateItem.trail), {
       fromUrl: beforeState.url,
+      fromUrlTemplate: fromTemplate.template,
+      requiredEntities: fromTemplate.requiredEntities,
       selector: action.selector,
       label: classification.label,
       verb: classification.verb,
@@ -604,10 +788,10 @@ async function probeActionTransition(params) {
 
 function mergeJourneyCandidates(existing, generated) {
   const byKey = new Map();
-  const combined = [...existing, ...generated];
+  const combined = [...safeArray(existing), ...safeArray(generated)];
 
   for (const journey of combined) {
-    const key = `${journey.intent}|${journey.entity}|${journey.entryUrl}|${journey.targetUrl || ''}`;
+    const key = `${journey.intent}|${journey.entity}|${journey.entryTemplate || journey.entryUrl}|${journey.targetTemplate || journey.targetUrl || ''}`;
     const current = byKey.get(key);
     if (!current || (journey.confidence || 0) > (current.confidence || 0)) {
       byKey.set(key, journey);
@@ -632,15 +816,29 @@ function synthesizeJourneysFromEdges(edges, config) {
       continue;
     }
 
+    const requiredEntities = new Set();
+    for (const step of safeArray(edge.trail)) {
+      for (const key of safeArray(step.requiredEntities)) {
+        requiredEntities.add(key);
+      }
+    }
+
+    const producedEntities = new Set(safeArray(edge.producedEntityKeys));
+
     const name = buildJourneyName(semantic.verb, semantic.entity);
     journeys.push({
-      id: `journey-${slugify(`${semantic.verb}-${semantic.entity}-${edge.from.route}`)}`,
+      id: `journey-${slugify(`${semantic.verb}-${semantic.entity}-${edge.from.routeTemplate || edge.from.route}`)}`,
       name,
       intent: semantic.verb,
       entity: semantic.entity,
+      context: edge.context || 'auth',
       confidence: semantic.confidence,
       entryUrl: edge.trail[0]?.fromUrl || edge.from.url,
+      entryTemplate: edge.trail[0]?.fromUrlTemplate || edge.from.routeTemplate,
       targetUrl: edge.to.url,
+      targetTemplate: edge.to.routeTemplate,
+      requiredEntities: Array.from(requiredEntities).sort(),
+      producedEntities: Array.from(producedEntities).sort(),
       status: 'discovered',
       steps: edge.trail,
       completionSignals: {
@@ -657,25 +855,61 @@ function synthesizeJourneysFromEdges(edges, config) {
     });
   }
 
-  return mergeUniqueBy(journeys, (journey) => `${journey.intent}|${journey.entity}|${journey.targetUrl}`);
+  return mergeUniqueBy(journeys, (journey) => {
+    return `${journey.intent}|${journey.entity}|${journey.targetTemplate || journey.targetUrl}`;
+  });
 }
 
 function featureFromEdge(edge) {
   return {
-    id: `feature-${slugify(`${edge.semantic.verb}-${edge.semantic.entity}-${edge.from.route}-${Date.now()}`)}`,
+    id: `feature-${slugify(`${edge.semantic.verb}-${edge.semantic.entity}-${edge.from.routeTemplate}-${Date.now()}`)}`,
     discoveredAt: edge.observedAt,
     journeyId: 'discovery',
     route: edge.from.route,
+    routeTemplate: edge.from.routeTemplate,
     verb: edge.semantic.verb,
     entity: edge.semantic.entity,
     actionLabel: edge.semantic.label,
     outcome: edge.changed ? 'state-changed' : 'no-observable-change',
+    context: edge.context,
+    producedEntities: safeArray(edge.producedEntityKeys),
     evidence: {
       screenshot: edge.screenshot,
       from: edge.from.url,
       to: edge.to.url
     }
   };
+}
+
+function buildSeedUrls(config, contextDef, entityRegistry) {
+  const urls = [];
+  const baseUrl = config.target.baseUrl;
+
+  for (const pathOrUrl of safeArray(contextDef.seedPaths)) {
+    if (!pathOrUrl) {
+      continue;
+    }
+
+    let candidate;
+    if (/^https?:\/\//i.test(pathOrUrl)) {
+      candidate = pathOrUrl;
+    } else {
+      candidate = new URL(pathOrUrl, baseUrl).toString();
+    }
+
+    const resolved = resolveTemplateUrl(routeTemplateFromUrl(candidate).template, entityRegistry);
+    if (resolved.missingEntities.length > 0) {
+      urls.push(candidate);
+    } else {
+      urls.push(resolved.resolvedUrl);
+    }
+  }
+
+  if (!urls.includes(baseUrl)) {
+    urls.unshift(baseUrl);
+  }
+
+  return Array.from(new Set(urls));
 }
 
 async function runDiscovery(config, paths) {
@@ -685,93 +919,200 @@ async function runDiscovery(config, paths) {
   ensureDir(path.join(runDir, 'screenshots'));
 
   const browser = await launchBrowser(config);
-  const storagePath = await ensureAuthStorageState(browser, config, paths);
-  const context = await browser.newContext({ storageState: storagePath });
-  const page = await context.newPage();
-
-  const queue = [{
-    url: config.target.baseUrl,
-    depth: 0,
-    trail: []
-  }];
-  const visitedStates = new Set();
-  const edges = [];
+  await ensureAuthStorageState(browser, config, paths);
 
   let knowledge = createKnowledgeBase(readJson(paths.knowledge, createKnowledgeBase()));
+  let routeUniverse = createRouteUniverse(readJson(paths.routeUniverse, createRouteUniverse()));
+  let entityRegistry = createEntityRegistry(readJson(paths.entityRegistry, createEntityRegistry()));
+  let copyInventory = createCopyInventory(readJson(paths.copyInventory, createCopyInventory()));
 
-  while (queue.length > 0 && visitedStates.size < config.discovery.maxStates) {
-    const stateItem = queue.shift();
+  const edges = [];
+  const contextStats = {};
 
-    await page.goto(stateItem.url, {
-      waitUntil: 'domcontentloaded',
-      timeout: config.browser.navigationTimeoutMs
-    });
-    await page.waitForTimeout(400);
+  for (const contextDef of safeArray(config.contexts)) {
+    const contextName = contextDef.name || 'unknown';
+    const context = await openContext(browser, contextDef, paths);
+    const page = await context.newPage();
 
-    const state = await capturePageState(page);
-    const stateKey = stateKeyFromState(state);
-    if (visitedStates.has(stateKey)) {
-      continue;
-    }
-    visitedStates.add(stateKey);
+    const queue = buildSeedUrls(config, contextDef, entityRegistry).map((url) => ({
+      url,
+      depth: 0,
+      trail: []
+    }));
 
-    const interactions = await extractInteractiveElements(page, {
-      maxElements: config.discovery.maxActionsPerState
-    });
+    const visitedStates = new Set();
+    let processedStates = 0;
 
-    for (const action of interactions.slice(0, config.discovery.maxActionsPerState)) {
-      await page.goto(state.url, {
-        waitUntil: 'domcontentloaded',
-        timeout: config.browser.navigationTimeoutMs
-      });
+    while (queue.length > 0 && processedStates < config.discovery.maxStates) {
+      const stateItem = queue.shift();
+      if (!stateItem?.url) {
+        continue;
+      }
 
-      const beforeState = await capturePageState(page);
-      const edge = await probeActionTransition({
-        page,
-        stateItem,
-        beforeState,
-        action,
-        config,
-        runOutputDir: path.join(runDir, 'screenshots'),
-        minConfidence: config.semantics.minConfidence,
-        learningsPath: paths.learnings,
-        lockPath: paths.lock,
-        runId
-      });
-
-      edges.push(edge);
-      appendJsonl(paths.edges, edge);
-
-      knowledge = updateKnowledgeBase(knowledge, edge.semantic, { url: beforeState.url });
-
-      if (
-        edge.changed &&
-        stateItem.depth < config.discovery.maxDepth &&
-        shouldQueueUrl(edge.to.url, config.target.baseUrl, config)
-      ) {
-        const nextTrail = edge.trail;
-        queue.push({
-          url: edge.to.url,
-          depth: stateItem.depth + 1,
-          trail: nextTrail
+      const templatedSeed = routeTemplateFromUrl(stateItem.url).template;
+      const resolved = resolveTemplateUrl(templatedSeed, entityRegistry);
+      if (resolved.missingEntities.length > 0) {
+        routeUniverse = upsertRouteObservation(routeUniverse, stateItem.url, {
+          context: contextName,
+          state: 'blocked_precondition'
         });
+        continue;
+      }
+
+      const targetUrl = resolved.resolvedUrl;
+
+      try {
+        await page.goto(targetUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: config.browser.navigationTimeoutMs
+        });
+      } catch {
+        routeUniverse = upsertRouteObservation(routeUniverse, targetUrl, {
+          context: contextName,
+          state: 'failed_navigation'
+        });
+        continue;
+      }
+
+      await page.waitForTimeout(350);
+      const state = await capturePageState(page);
+      const template = routeTemplateFromUrl(state.url).template;
+
+      const stateKey = `${contextName}|${template}|${stateKeyFromState(state)}`;
+      if (visitedStates.has(stateKey)) {
+        continue;
+      }
+
+      visitedStates.add(stateKey);
+      processedStates += 1;
+
+      routeUniverse = upsertRouteObservation(routeUniverse, state.url, {
+        context: contextName,
+        state: 'visited'
+      });
+
+      const urlEntities = extractEntityValuesFromUrl(state.url);
+      entityRegistry = upsertEntityValues(entityRegistry, urlEntities, {
+        source: `url:${contextName}`
+      });
+
+      copyInventory = addCopyEntry(copyInventory, {
+        url: state.url,
+        context: contextName,
+        text: [state.title, state.headline].filter(Boolean).join(' | ')
+      });
+
+      const interactions = await extractInteractiveElements(page, {
+        maxElements: config.discovery.maxActionsPerState
+      });
+
+      for (const action of interactions.slice(0, config.discovery.maxActionsPerState)) {
+        await page.goto(state.url, {
+          waitUntil: 'domcontentloaded',
+          timeout: config.browser.navigationTimeoutMs
+        });
+        await page.waitForTimeout(200);
+
+        const beforeState = await capturePageState(page);
+
+        const edge = await probeActionTransition({
+          page,
+          stateItem,
+          beforeState,
+          action,
+          config,
+          runOutputDir: path.join(runDir, 'screenshots'),
+          minConfidence: config.semantics.minConfidence,
+          learningsPath: paths.learnings,
+          lockPath: paths.lock,
+          runId,
+          contextName
+        });
+
+        edges.push(edge);
+        appendJsonl(paths.edges, edge);
+
+        knowledge = updateKnowledgeBase(knowledge, edge.semantic, { url: beforeState.url });
+        entityRegistry = upsertEntityValues(entityRegistry, edge.extractedEntities, {
+          source: `edge:${contextName}`
+        });
+
+        routeUniverse = upsertRouteObservation(routeUniverse, edge.from.url, {
+          context: contextName,
+          state: 'executed'
+        });
+        routeUniverse = upsertRouteObservation(routeUniverse, edge.to.url, {
+          context: contextName,
+          state: edge.changed ? 'visited' : 'observed'
+        });
+
+        copyInventory = addCopyEntry(copyInventory, {
+          url: edge.from.url,
+          context: contextName,
+          text: edge.semantic?.label || action.text || action.ariaLabel || action.title || ''
+        });
+
+        if (
+          edge.changed &&
+          stateItem.depth < config.discovery.maxDepth &&
+          shouldQueueUrl(edge.to.url, config.target.baseUrl, config)
+        ) {
+          queue.push({
+            url: edge.to.url,
+            depth: stateItem.depth + 1,
+            trail: edge.trail
+          });
+        }
+
+        if (action.href) {
+          const maybeUrl = (() => {
+            try {
+              return new URL(action.href, state.url).toString();
+            } catch {
+              return '';
+            }
+          })();
+
+          if (shouldQueueUrl(maybeUrl, config.target.baseUrl, config)) {
+            queue.push({
+              url: maybeUrl,
+              depth: stateItem.depth + 1,
+              trail: edge.trail
+            });
+          }
+        }
       }
     }
+
+    contextStats[contextName] = {
+      visitedStates: processedStates,
+      edges: edges.filter((edge) => edge.context === contextName).length
+    };
+
+    await context.close();
   }
 
-  const existingJourneys = readJson(paths.journeys, { version: 1, journeys: [] }).journeys || [];
+  const existingJourneys = readJson(paths.journeys, { version: 2, journeys: [] }).journeys || [];
   const generatedJourneys = synthesizeJourneysFromEdges(edges, config);
   const journeys = mergeJourneyCandidates(existingJourneys, generatedJourneys);
 
-  const existingFeatures = readJson(paths.features, { version: 1, features: [] }).features || [];
+  const existingFeatures = readJson(paths.features, { version: 2, features: [] }).features || [];
   const generatedFeatures = edges.map(featureFromEdge);
   const features = mergeUniqueBy([...existingFeatures, ...generatedFeatures], (feature) => {
-    return `${feature.route}|${feature.verb}|${feature.entity}|${normalizeText(feature.actionLabel)}`;
+    return `${feature.routeTemplate}|${feature.verb}|${feature.entity}|${normalizeText(feature.actionLabel)}`;
   });
 
+  const routeCoverage = buildRouteCoverage(routeUniverse);
+  const journeyGraph = buildJourneyDependencyGraph(journeys, routeUniverse, entityRegistry);
+
   writeJson(paths.knowledge, knowledge);
-  writeJson(paths.journeys, { version: 1, generatedAt: nowIso(), journeys });
-  writeJson(paths.features, { version: 1, generatedAt: nowIso(), features });
+  writeJson(paths.routeUniverse, routeUniverse);
+  writeJson(paths.entityRegistry, entityRegistry);
+  writeJson(paths.copyInventory, copyInventory);
+  writeJson(paths.journeys, { version: 2, generatedAt: nowIso(), journeys });
+  writeJson(paths.features, { version: 2, generatedAt: nowIso(), features });
+  writeJson(paths.journeyGraph, journeyGraph);
+
   fs.writeFileSync(paths.journeysMd, renderJourneyMarkdown(journeys), 'utf8');
   fs.writeFileSync(paths.featuresMd, renderFeatureMarkdown(features), 'utf8');
 
@@ -796,36 +1137,59 @@ async function runDiscovery(config, paths) {
     paths.learnings,
     paths.lock,
     'Confirmed behaviors',
-    `Discovery visited ${visitedStates.size} unique states and generated ${generatedJourneys.length} journey candidates`,
+    `Discovery visited ${routeCoverage.executedRoutes} route templates across ${safeArray(config.contexts).length} contexts and generated ${generatedJourneys.length} journey candidates`,
     { runId, url: config.target.baseUrl }
   );
 
-  await context.close();
+  const copyIssueHints = buildCopyIssueHints(copyInventory);
+  writeJson(paths.copyIssues, copyIssueHints);
+
+  const expectedVsFound = buildExpectedVsFoundReport(knowledge);
+  writeJson(paths.expectedVsFound, expectedVsFound);
+  fs.writeFileSync(paths.expectedVsFoundMd, renderExpectedVsFoundMarkdown(expectedVsFound), 'utf8');
+
+  const coverage = buildCoverageFrontier({
+    journeys,
+    features,
+    expectedVsFound
+  });
+
+  writeJson(paths.coverageFrontier, {
+    ...coverage,
+    routeCoverage,
+    contextStats,
+    mode: config.coverage.mode,
+    targetPct: config.coverage.targetPct
+  });
+
   await browser.close();
 
   updateState(paths, {
     lastCommand: 'discover',
     discovery: {
       completedAt: nowIso(),
-      stateCount: visitedStates.size,
+      stateCount: Object.values(contextStats).reduce((sum, item) => sum + item.visitedStates, 0),
       edgeCount: edges.length,
-      candidateJourneyCount: generatedJourneys.length
+      candidateJourneyCount: generatedJourneys.length,
+      routeCoveragePct: routeCoverage.coveragePct
     }
   });
 
   return {
     runId,
-    stateCount: visitedStates.size,
+    stateCount: Object.values(contextStats).reduce((sum, item) => sum + item.visitedStates, 0),
     edgeCount: edges.length,
-    generatedJourneys
+    generatedJourneys,
+    routeCoverage
   };
 }
 
 async function clickButtonByText(page, texts = []) {
   for (const text of texts) {
+    const escaped = text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const button = page
       .locator('button, [role="button"], [type="submit"]')
-      .filter({ hasText: new RegExp(`^\\s*${text.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\s*$`, 'i') })
+      .filter({ hasText: new RegExp(`^\\s*${escaped}\\s*$`, 'i') })
       .first();
 
     if (await button.isVisible().catch(() => false)) {
@@ -864,7 +1228,7 @@ async function executeDestructiveBranches(page, step, config, contextInfo) {
     return outcomes;
   }
 
-  await page.goto(step.fromUrl, {
+  await page.goto(contextInfo.replayUrl, {
     waitUntil: 'domcontentloaded',
     timeout: config.browser.navigationTimeoutMs
   });
@@ -906,6 +1270,10 @@ async function executeDestructiveBranches(page, step, config, contextInfo) {
   return outcomes;
 }
 
+function missingEntitiesForJourney(journey, entityRegistry) {
+  return safeArray(journey.requiredEntities).filter((key) => !entityRegistry?.latestValues?.[key]);
+}
+
 async function executeJourney(browser, config, paths, journey, shared) {
   const runId = `journey-${journey.id}-${Date.now()}`;
   const runDir = path.join(paths.runs, runId);
@@ -913,9 +1281,11 @@ async function executeJourney(browser, config, paths, journey, shared) {
   ensureDir(runDir);
   ensureDir(screenshotDir);
 
-  const context = await browser.newContext({
-    storageState: fs.existsSync(paths.authState) ? paths.authState : undefined
-  });
+  const contextDef = safeArray(config.contexts).find((ctx) => ctx.name === journey.context) ||
+    safeArray(config.contexts).find((ctx) => ctx.auth) ||
+    { name: 'auth', auth: true };
+
+  const context = await openContext(browser, contextDef, paths);
   const page = await context.newPage();
 
   const localFeatures = [];
@@ -924,16 +1294,38 @@ async function executeJourney(browser, config, paths, journey, shared) {
 
   let completedSteps = 0;
   let failed = false;
+  let blocked = false;
 
   for (const step of safeArray(journey.steps).slice(0, config.mapping.maxJourneySteps)) {
+    const templateToResolve = step.fromUrlTemplate || step.fromUrl;
+    const resolved = resolveTemplateUrl(templateToResolve, shared.entityRegistry);
+
+    if (resolved.missingEntities.length > 0) {
+      blocked = true;
+      events.push({
+        step,
+        status: 'blocked_precondition',
+        missingEntities: resolved.missingEntities
+      });
+      break;
+    }
+
+    const stepUrl = resolved.resolvedUrl;
+
     try {
-      await page.goto(step.fromUrl, {
+      await page.goto(stepUrl, {
         waitUntil: 'domcontentloaded',
         timeout: config.browser.navigationTimeoutMs
       });
-      await page.waitForTimeout(350);
+      await page.waitForTimeout(250);
+
+      shared.routeUniverse = upsertRouteObservation(shared.routeUniverse, stepUrl, {
+        context: journey.context || 'auth',
+        state: 'visited'
+      });
 
       const before = await capturePageState(page);
+
       const action = {
         selector: step.selector,
         tagName: 'button',
@@ -942,51 +1334,65 @@ async function executeJourney(browser, config, paths, journey, shared) {
         title: step.label
       };
 
-      const actionResult = await performAction(page, action, config);
-      await page.waitForTimeout(config.mapping.waitAfterActionMs);
-
-      const after = await capturePageState(page);
-
-      const classification = classifyAction(action, before, { networkMutations: [] });
-      const stepScreenshot = await captureScreenshotIfEnabled(
+      const edge = await probeActionTransition({
         page,
+        stateItem: { trail: [] },
+        beforeState: before,
+        action,
         config,
-        screenshotDir,
-        'journey-step',
-        after.url,
-        step.label
-      );
+        runOutputDir: screenshotDir,
+        minConfidence: config.semantics.minConfidence,
+        learningsPath: paths.learnings,
+        lockPath: paths.lock,
+        runId,
+        contextName: journey.context || 'auth'
+      });
+
+      const after = edge.to ? { url: edge.to.url, routeTemplate: edge.to.routeTemplate } : { url: page.url() };
+
+      shared.entityRegistry = upsertEntityValues(shared.entityRegistry, edge.extractedEntities || {}, {
+        source: `journey:${journey.id}`
+      });
+
+      shared.routeUniverse = upsertRouteObservation(shared.routeUniverse, after.url || page.url(), {
+        context: journey.context || 'auth',
+        state: edge.changed ? 'executed' : 'observed'
+      });
 
       localFeatures.push({
-        id: `feature-${slugify(`${journey.id}-${step.selector}-${Date.now()}`)}`,
+        id: `feature-${slugify(`${journey.id}-${step.selector || step.label}-${Date.now()}`)}`,
         discoveredAt: nowIso(),
         journeyId: journey.id,
         route: routeFromUrl(before.url),
-        verb: classification.verb,
-        entity: classification.entity,
-        actionLabel: classification.label,
-        outcome:
-          before.fingerprint !== after.fingerprint || before.url !== after.url
-            ? 'state-changed'
-            : 'no-observable-change',
+        routeTemplate: routeTemplateFromUrl(before.url).template,
+        verb: edge.semantic?.verb || 'navigate',
+        entity: edge.semantic?.entity || journey.entity,
+        actionLabel: edge.semantic?.label || step.label,
+        outcome: edge.changed ? 'state-changed' : 'no-observable-change',
+        context: journey.context,
+        producedEntities: safeArray(edge.producedEntityKeys),
         evidence: {
-          screenshot: stepScreenshot,
+          screenshot: edge.screenshot,
           from: before.url,
-          to: after.url
+          to: after.url || page.url()
         }
       });
 
       events.push({
         step,
-        actionResult,
-        before,
-        after
+        status: 'ok',
+        fromUrl: before.url,
+        toUrl: after.url || page.url(),
+        producedEntities: edge.producedEntityKeys
       });
 
       completedSteps += 1;
 
       if (isDestructiveCandidate(action, config) || step.destructiveHint) {
-        const outcomes = await executeDestructiveBranches(page, step, config, { screenshotDir });
+        const outcomes = await executeDestructiveBranches(page, step, config, {
+          screenshotDir,
+          replayUrl: stepUrl
+        });
         branchFindings.push({ step, outcomes });
 
         await appendLearning(
@@ -1003,13 +1409,14 @@ async function executeJourney(browser, config, paths, journey, shared) {
       failed = true;
       events.push({
         step,
+        status: 'error',
         error: error.message
       });
       break;
     }
   }
 
-  const status = failed ? 'failed' : completedSteps > 0 ? 'completed' : 'no-op';
+  const status = blocked ? 'blocked' : failed ? 'failed' : completedSteps > 0 ? 'completed' : 'no-op';
 
   await appendLearning(
     paths.learnings,
@@ -1052,7 +1459,8 @@ async function executeJourney(browser, config, paths, journey, shared) {
     status,
     completedSteps,
     localFeatures,
-    branchFindings
+    branchFindings,
+    missingEntities: status === 'blocked' ? missingEntitiesForJourney(journey, shared.entityRegistry) : []
   };
 }
 
@@ -1079,76 +1487,123 @@ async function runJourneyMapping(config, paths) {
   const browser = await launchBrowser(config);
   await ensureAuthStorageState(browser, config, paths);
 
-  const journeysPayload = readJson(paths.journeys, { version: 1, journeys: [] });
+  const journeysPayload = readJson(paths.journeys, { version: 2, journeys: [] });
   const journeys = safeArray(journeysPayload.journeys);
 
   if (!journeys.length) {
     await browser.close();
-    return { completed: 0, failed: 0, features: [] };
+    return { completed: 0, failed: 0, blocked: 0, features: 0 };
   }
 
   const shared = {
-    knowledge: createKnowledgeBase(readJson(paths.knowledge, createKnowledgeBase()))
+    knowledge: createKnowledgeBase(readJson(paths.knowledge, createKnowledgeBase())),
+    entityRegistry: createEntityRegistry(readJson(paths.entityRegistry, createEntityRegistry())),
+    routeUniverse: createRouteUniverse(readJson(paths.routeUniverse, createRouteUniverse()))
   };
 
-  const results = await runInPool(journeys, config.mapping.concurrency, (journey) => {
-    return executeJourney(browser, config, paths, journey, shared);
-  });
+  const pending = [...journeys];
+  const results = [];
+  let safetyIterations = 0;
+
+  while (pending.length > 0 && safetyIterations < 200) {
+    safetyIterations += 1;
+
+    const ready = pending.filter((journey) => missingEntitiesForJourney(journey, shared.entityRegistry).length === 0);
+
+    if (ready.length === 0) {
+      for (const journey of pending) {
+        results.push({
+          journeyId: journey.id,
+          status: 'blocked',
+          completedSteps: 0,
+          localFeatures: [],
+          branchFindings: [],
+          missingEntities: missingEntitiesForJourney(journey, shared.entityRegistry)
+        });
+      }
+      break;
+    }
+
+    const batch = ready.slice(0, Math.max(1, config.mapping.concurrency));
+    const batchResults = await runInPool(batch, config.mapping.concurrency, (journey) => {
+      return executeJourney(browser, config, paths, journey, shared);
+    });
+
+    results.push(...batchResults);
+
+    const processedIds = new Set(batch.map((journey) => journey.id));
+    for (let i = pending.length - 1; i >= 0; i -= 1) {
+      if (processedIds.has(pending[i].id)) {
+        pending.splice(i, 1);
+      }
+    }
+  }
 
   await browser.close();
 
-  const currentFeatures = readJson(paths.features, { version: 1, features: [] }).features || [];
+  const currentFeatures = readJson(paths.features, { version: 2, features: [] }).features || [];
   const mappedFeatures = results.flatMap((result) => result.localFeatures || []);
   const mergedFeatures = mergeUniqueBy([...currentFeatures, ...mappedFeatures], (feature) => {
-    return `${feature.journeyId}|${feature.route}|${feature.verb}|${feature.entity}|${normalizeText(feature.actionLabel)}`;
+    return `${feature.journeyId}|${feature.routeTemplate}|${feature.verb}|${feature.entity}|${normalizeText(feature.actionLabel)}`;
   });
 
-  const completedJourneyIds = new Set(
-    results.filter((result) => result.status === 'completed').map((result) => result.journeyId)
-  );
-
-  const failedJourneyIds = new Set(
-    results.filter((result) => result.status === 'failed').map((result) => result.journeyId)
-  );
+  const resultByJourneyId = Object.fromEntries(results.map((result) => [result.journeyId, result]));
 
   const updatedJourneys = journeys.map((journey) => {
-    if (completedJourneyIds.has(journey.id)) {
-      return {
-        ...journey,
-        status: 'completed',
-        mappedAt: nowIso()
-      };
+    const result = resultByJourneyId[journey.id];
+    if (!result) {
+      return journey;
     }
 
-    if (failedJourneyIds.has(journey.id)) {
-      return {
-        ...journey,
-        status: 'failed',
-        mappedAt: nowIso()
-      };
-    }
-
-    return journey;
+    const missing = safeArray(result.missingEntities);
+    return {
+      ...journey,
+      status: result.status,
+      mappedAt: nowIso(),
+      lastMissingEntities: missing
+    };
   });
 
+  const expectedVsFound = buildExpectedVsFoundReport(shared.knowledge);
+  const routeCoverage = buildRouteCoverage(shared.routeUniverse);
+  const journeyGraph = buildJourneyDependencyGraph(updatedJourneys, shared.routeUniverse, shared.entityRegistry);
+  const criticalPaths = buildCriticalPaths(updatedJourneys);
+  const e2eSpecs = buildE2ESpecs(updatedJourneys, shared.entityRegistry);
+  const smokeSuite = buildSmokeSuite(e2eSpecs, criticalPaths);
+  const copyInventory = createCopyInventory(readJson(paths.copyInventory, createCopyInventory()));
+  const copyIssues = buildCopyIssueHints(copyInventory);
+
   writeJson(paths.knowledge, shared.knowledge);
-  writeJson(paths.features, { version: 1, generatedAt: nowIso(), features: mergedFeatures });
-  writeJson(paths.journeys, { version: 1, generatedAt: nowIso(), journeys: updatedJourneys });
+  writeJson(paths.entityRegistry, shared.entityRegistry);
+  writeJson(paths.routeUniverse, shared.routeUniverse);
+  writeJson(paths.features, { version: 2, generatedAt: nowIso(), features: mergedFeatures });
+  writeJson(paths.journeys, { version: 2, generatedAt: nowIso(), journeys: updatedJourneys });
+  writeJson(paths.expectedVsFound, expectedVsFound);
+  writeJson(paths.journeyGraph, journeyGraph);
+  writeJson(paths.criticalPaths, criticalPaths);
+  writeJson(paths.e2eSpecs, e2eSpecs);
+  writeJson(paths.smokeSuite, smokeSuite);
+  writeJson(paths.copyIssues, copyIssues);
+
   fs.writeFileSync(paths.featuresMd, renderFeatureMarkdown(mergedFeatures), 'utf8');
   fs.writeFileSync(paths.journeysMd, renderJourneyMarkdown(updatedJourneys), 'utf8');
-
-  const expectedVsFound = buildExpectedVsFoundReport(shared.knowledge);
-  writeJson(paths.expectedVsFound, expectedVsFound);
   fs.writeFileSync(paths.expectedVsFoundMd, renderExpectedVsFoundMarkdown(expectedVsFound), 'utf8');
 
-  const frontier = buildCoverageFrontier({
+  const coverage = buildCoverageFrontier({
     journeys: updatedJourneys,
     features: mergedFeatures,
     expectedVsFound
   });
-  writeJson(paths.coverageFrontier, frontier);
 
-  if ((expectedVsFound.missing || []).length > 0) {
+  writeJson(paths.coverageFrontier, {
+    ...coverage,
+    routeCoverage,
+    mode: config.coverage.mode,
+    targetPct: config.coverage.targetPct,
+    isTargetMet: routeCoverage.coveragePct >= Number(config.coverage.targetPct || 95)
+  });
+
+  if (safeArray(expectedVsFound.missing).length > 0) {
     await appendLearning(
       paths.learnings,
       paths.lock,
@@ -1160,29 +1615,37 @@ async function runJourneyMapping(config, paths) {
 
   const completed = results.filter((item) => item.status === 'completed').length;
   const failed = results.filter((item) => item.status === 'failed').length;
+  const blocked = results.filter((item) => item.status === 'blocked').length;
 
   updateState(paths, {
     lastCommand: 'map',
     mapping: {
       completedAt: nowIso(),
       completedJourneyCount: completed,
-      failedJourneyCount: failed
+      failedJourneyCount: failed,
+      blockedJourneyCount: blocked,
+      routeCoveragePct: routeCoverage.coveragePct
     }
   });
 
   return {
     completed,
     failed,
+    blocked,
     features: mappedFeatures.length,
-    expectedCoverage: expectedVsFound.overallCoveragePct
+    expectedCoverage: expectedVsFound.overallCoveragePct,
+    routeCoverage
   };
 }
 
 function statusSummary(paths) {
-  const state = readJson(paths.state, DEFAULT_STATE);
-  const journeys = readJson(paths.journeys, { version: 1, journeys: [] }).journeys || [];
-  const features = readJson(paths.features, { version: 1, features: [] }).features || [];
+  const state = normalizeStateShape(readJson(paths.state, DEFAULT_STATE));
+  const journeys = readJson(paths.journeys, { version: 2, journeys: [] }).journeys || [];
+  const features = readJson(paths.features, { version: 2, features: [] }).features || [];
   const expected = readJson(paths.expectedVsFound, { overallCoveragePct: 0, missing: [] });
+  const routeUniverse = createRouteUniverse(readJson(paths.routeUniverse, createRouteUniverse()));
+  const routeCoverage = buildRouteCoverage(routeUniverse);
+  const journeyGraph = readJson(paths.journeyGraph, { version: 2, unresolvedEntities: [] });
 
   const summary = {
     state,
@@ -1190,16 +1653,27 @@ function statusSummary(paths) {
       journeysTotal: journeys.length,
       journeysCompleted: journeys.filter((journey) => journey.status === 'completed').length,
       journeysFailed: journeys.filter((journey) => journey.status === 'failed').length,
+      journeysBlocked: journeys.filter((journey) => journey.status === 'blocked').length,
       featuresTotal: features.length,
       expectationCoveragePct: expected.overallCoveragePct || 0,
-      missingExpectations: safeArray(expected.missing).length
+      missingExpectations: safeArray(expected.missing).length,
+      routeCoverage,
+      unresolvedRouteEntities: safeArray(journeyGraph.unresolvedEntities).length
     },
     artifacts: {
       journeys: paths.journeys,
       features: paths.features,
       expectedVsFound: paths.expectedVsFound,
       coverageFrontier: paths.coverageFrontier,
-      learnings: paths.learnings
+      learnings: paths.learnings,
+      routeUniverse: paths.routeUniverse,
+      entityRegistry: paths.entityRegistry,
+      journeyGraph: paths.journeyGraph,
+      criticalPaths: paths.criticalPaths,
+      e2eSpecs: paths.e2eSpecs,
+      smokeSuite: paths.smokeSuite,
+      copyInventory: paths.copyInventory,
+      copyIssues: paths.copyIssues
     }
   };
 

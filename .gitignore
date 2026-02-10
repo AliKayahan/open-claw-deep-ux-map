@@ -3,4 +3,12 @@ playwright-report/
 artifacts/browser/
 artifacts/runs/
 artifacts/tmp/
+artifacts/route-universe.json
+artifacts/entity-registry.json
+artifacts/journey-graph.json
+artifacts/critical-paths.json
+artifacts/e2e-specs.json
+artifacts/smoke-suite.json
+artifacts/copy-inventory.json
+artifacts/copy-issues.json
 .DS_Store
