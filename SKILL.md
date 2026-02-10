@@ -25,11 +25,12 @@ Use for requests like:
 5. Use LLM-first planning (Anthropic) with strict schema validation and heuristic fallback on failure.
 6. Execute form episodes (field fill + submit) to unlock downstream actions.
 7. Detect and satisfy gates (counts, min-fields, wizard steps, required selections).
-8. Replay each journey in a fresh context to avoid context bloat.
-9. For destructive actions, test both modal branches (`Cancel`, then `Confirm`) when enabled.
-10. Persist cross-run memory in `artifacts/learnings.md` with file-lock-safe append logic.
-11. Emit per-journey completion updates with name, depth, start, end, milestones, and gate stats.
-12. Output structured maps for journey analysis and test generation.
+8. Run platform-agnostic mission/critic loops to behave like a curious human explorer.
+9. Replay each journey in a fresh context to avoid context bloat.
+10. For destructive actions, test both modal branches (`Cancel`, then `Confirm`) when enabled.
+11. Persist cross-run memory in `artifacts/learnings.md` with file-lock-safe append logic.
+12. Emit per-journey completion updates with name, depth, start, end, milestones, gate stats, and mission progress.
+13. Output structured maps for journey analysis and test generation.
 
 ## Execution steps
 
@@ -49,6 +50,7 @@ Use for requests like:
 - `planning.mode`: `llm-first` or `heuristic-fallback`
 - `llm.apiKeyEnv`: env key used to access Anthropic API
 - `gates.maxSatisfyAttempts`: loop cap when satisfying unlock requirements
+- `mission.*`: platform-agnostic “human-like” progression knobs (repeatable creates, chat turns, branch exploration)
 - `safety.allowDestructiveConfirm`: whether confirm branch is executed
 - `semantics.minConfidence`: threshold for accepting semantic candidates
 

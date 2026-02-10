@@ -17,6 +17,7 @@ It is designed for:
 - LLM-first planning (Anthropic) with strict action-plan schema validation and heuristic fallback.
 - Stateful form episodes (fill/validate/submit) to unlock downstream actions.
 - Gate detection/satisfaction loops for count and wizard prerequisites.
+- Platform-agnostic mission/critic weave: create-heavy flows, wizard gates, branch exploration, and optional chat surfaces.
 - Branch handling for destructive actions: `Cancel` then `Confirm` (when enabled).
 - Real-time per-journey progress events (stdout + `journey-progress.jsonl`) with name, depth, start, end, milestones, and gate stats.
 - Persistent cross-run learning in `artifacts/learnings.md`.
@@ -91,6 +92,7 @@ Core outputs:
 - `form-ledger.jsonl`: form fill/submit traces and generated values
 - `gate-ledger.jsonl`: gate detection and satisfaction attempts
 - `journey-milestones.jsonl`: step-level unlock milestones
+- `journey-progress.jsonl` now includes mission progress fields (`missionProgressPct`, `missionCompletedGoals`)
 - `expected-vs-found.json` / `expected-vs-found.md`: inferred capability gaps
 - `coverage-frontier.json`: mapping progress + route coverage against target
 - `learnings.md`: append-only cross-run memory

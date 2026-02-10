@@ -65,6 +65,14 @@ import { normalizePlannerPlan, validatePlannerPlan } from './lib/llm/planner-sch
 import { collectFormCandidates, chooseFormCandidate, executeFormEpisode } from './lib/form-engine.mjs';
 import { detectGates, gateProgress, isGateSatisfied, selectGateActionHints } from './lib/gate-engine.mjs';
 import { createLoopGuard, prioritizeInteractions } from './lib/policy/curiosity-policy.mjs';
+import {
+  createMissionState,
+  detectScreenSignals,
+  missionProgressSummary,
+  proposeMissionActions,
+  updateMissionStateFromEvent
+} from './lib/mission-engine.mjs';
+import { critiqueScreenProgress } from './lib/critic-engine.mjs';
 
 const DEFAULT_CONFIG = {
   version: 3,
@@ -160,6 +168,13 @@ const DEFAULT_CONFIG = {
     maxJourneyMinutes: 15,
     maxScreenVisitsPerJourney: 100,
     maxRepeatedActionCount: 5
+  },
+  mission: {
+    minRepeatableCreateTarget: 8,
+    maxRepeatableCreateTarget: 10,
+    chatTurnsTarget: 3,
+    branchExplorationTarget: 6,
+    maxMissionRepeat: 4
   },
   semantics: {
     minConfidence: 0.45
@@ -353,6 +368,10 @@ function loadConfig(configPath) {
       ...DEFAULT_CONFIG.budgets,
       ...(loaded.budgets || {})
     },
+    mission: {
+      ...DEFAULT_CONFIG.mission,
+      ...(loaded.mission || {})
+    },
     semantics: {
       ...DEFAULT_CONFIG.semantics,
       ...(loaded.semantics || {})
@@ -413,6 +432,10 @@ function validateConfig(config) {
 
   if (Number(config.gates?.maxSatisfyAttempts) <= 0) {
     errors.push('gates.maxSatisfyAttempts must be > 0');
+  }
+
+  if (Number(config.mission?.maxMissionRepeat) <= 0) {
+    errors.push('mission.maxMissionRepeat must be > 0');
   }
 
   return errors;
@@ -1144,6 +1167,29 @@ async function buildPlanFromScreen(params) {
   };
 }
 
+function mergePlanActions(actionGroups, maxActions = 10) {
+  const merged = [];
+  const seen = new Set();
+
+  for (const group of safeArray(actionGroups)) {
+    for (const action of safeArray(group)) {
+      const key = `${action?.actionType || ''}|${action?.target?.selector || ''}|${normalizeText(
+        `${action?.target?.label || ''} ${action?.target?.contains || ''}`
+      )}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      merged.push(action);
+      if (merged.length >= maxActions) {
+        return merged;
+      }
+    }
+  }
+
+  return merged;
+}
+
 function mergeJourneyCandidates(existing, generated) {
   const byKey = new Map();
   const combined = [...safeArray(existing), ...safeArray(generated)];
@@ -1689,7 +1735,8 @@ async function runPlannedScreenProgression(params) {
     runMeta,
     screenshotDir,
     contextName,
-    recentEvents
+    recentEvents,
+    missionState
   } = params;
 
   const visitedSignatures = new Set();
@@ -1781,10 +1828,47 @@ async function runPlannedScreenProgression(params) {
 
     degradedPlanningUsed = degradedPlanningUsed || planOutcome.degradedPlanning;
     const plan = planOutcome.plan;
+    const screenSignals = detectScreenSignals(screenContext, interactions, gates);
+    const missionOutcome = proposeMissionActions({
+      missionState,
+      screenContext,
+      interactions,
+      gates,
+      config: config.mission,
+      recentEvents,
+      screenSignals
+    });
+    const criticOutcome = critiqueScreenProgress({
+      recentEvents,
+      interactions,
+      gates
+    });
+
+    appendJsonl(paths.journeyMilestones, {
+      at: nowIso(),
+      runId: runMeta.runId,
+      journeyId: runMeta.journeyId,
+      kind: 'screen-analysis',
+      url: beforeState.url,
+      details: {
+        signals: screenSignals,
+        missionNotes: missionOutcome.notes,
+        criticBlockedHypothesis: criticOutcome.blockedHypothesis || ''
+      }
+    });
 
     let executedAny = false;
 
-    for (const planAction of safeArray(plan.priorityActions).slice(0, config.planning.maxLoopIterationsPerGate)) {
+    const candidatePlanActions = mergePlanActions(
+      [
+        missionOutcome.actions,
+        plan.priorityActions,
+        criticOutcome.actions
+      ],
+      config.planning.maxLoopIterationsPerGate
+    );
+
+    for (const planAction of safeArray(candidatePlanActions).slice(0, config.planning.maxLoopIterationsPerGate)) {
       const resolved = resolvePlannedAction(planAction, interactions);
       if (!resolved) {
         continue;
@@ -1850,6 +1934,7 @@ async function runPlannedScreenProgression(params) {
           changed: edge.changed
         };
         recentEvents.push(event);
+        updateMissionStateFromEvent(missionState, event);
 
         const gateChecks = detectGates(
           {
@@ -1906,6 +1991,8 @@ async function runPlannedScreenProgression(params) {
     if (!executedAny) {
       if (gates.length > 0) {
         blockedReason = blockedReason || `gate_unresolved:${gates[0].gateType}`;
+      } else if (criticOutcome.shouldBranch && criticOutcome.blockedHypothesis) {
+        blockedReason = blockedReason || `critic:${criticOutcome.blockedHypothesis}`;
       }
       break;
     }
@@ -1921,7 +2008,8 @@ async function runPlannedScreenProgression(params) {
     milestones,
     gatesSatisfied,
     blockedReason,
-    degradedPlanningUsed
+    degradedPlanningUsed,
+    missionSummary: missionProgressSummary(missionState)
   };
 }
 
@@ -1946,10 +2034,12 @@ async function executeJourney(browser, config, paths, journey, shared, plannerCl
   const localFeatures = [];
   const branchFindings = [];
   const events = [];
+  const missionState = createMissionState(config.mission);
   let milestonesCompleted = 0;
   let gatesSatisfied = 0;
   let blockedReason = '';
   let degradedPlanning = false;
+  let missionSummary = missionProgressSummary(missionState);
 
   let completedSteps = 0;
   let failed = false;
@@ -1996,7 +2086,8 @@ async function executeJourney(browser, config, paths, journey, shared, plannerCl
         },
         screenshotDir,
         contextName: journey.context || 'auth',
-        recentEvents: events
+        recentEvents: events,
+        missionState
       });
 
       degradedPlanning = degradedPlanning || progression.degradedPlanningUsed;
@@ -2004,6 +2095,7 @@ async function executeJourney(browser, config, paths, journey, shared, plannerCl
       milestonesCompleted += safeArray(progression.milestones).length;
       gatesSatisfied += Number(progression.gatesSatisfied || 0);
       localFeatures.push(...safeArray(progression.localFeatures));
+      missionSummary = progression.missionSummary || missionSummary;
 
       const before = await capturePageState(page);
 
@@ -2127,6 +2219,7 @@ async function executeJourney(browser, config, paths, journey, shared, plannerCl
     gatesSatisfied,
     blockedReason,
     degradedPlanning,
+    missionSummary,
     branchFindings,
     events
   });
@@ -2158,6 +2251,7 @@ async function executeJourney(browser, config, paths, journey, shared, plannerCl
     gatesSatisfied,
     blockedReason,
     degradedPlanning,
+    missionSummary,
     localFeatures,
     branchFindings,
     missingEntities: status === 'blocked' ? missingEntitiesForJourney(journey, shared.entityRegistry) : []
@@ -2231,6 +2325,8 @@ async function runJourneyMapping(config, paths) {
       milestonesCompleted: Number(result.milestonesCompleted || 0),
       gatesSatisfied: Number(result.gatesSatisfied || 0),
       blockedReason: result.blockedReason || '',
+      missionProgressPct: Number(result.missionSummary?.progressPct || 0),
+      missionCompletedGoals: safeArray(result.missionSummary?.completedGoals),
       start: startPoint,
       end: endPoint,
       missingEntities: safeArray(result.missingEntities)
@@ -2308,7 +2404,8 @@ async function runJourneyMapping(config, paths) {
       milestonesCompleted: Number(result.milestonesCompleted || 0),
       gatesSatisfied: Number(result.gatesSatisfied || 0),
       blockedReason: result.blockedReason || '',
-      degradedPlanning: Boolean(result.degradedPlanning)
+      degradedPlanning: Boolean(result.degradedPlanning),
+      missionSummary: result.missionSummary || null
     };
   });
 

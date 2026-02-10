@@ -125,6 +125,13 @@
     "maxScreenVisitsPerJourney": 100,
     "maxRepeatedActionCount": 5
   },
+  "mission": {
+    "minRepeatableCreateTarget": 8,
+    "maxRepeatableCreateTarget": 10,
+    "chatTurnsTarget": 3,
+    "branchExplorationTarget": 6,
+    "maxMissionRepeat": 4
+  },
   "semantics": {
     "minConfidence": 0.45
   },
