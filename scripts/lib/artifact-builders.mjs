@@ -5,9 +5,20 @@ function scoreJourney(journey) {
   const producedWeight = safeArray(journey.producedEntities).length * 4;
   const stepWeight = safeArray(journey.steps).length;
   const destructiveWeight = safeArray(journey.steps).filter((step) => step.destructiveHint).length * 2;
-  const statusWeight = journey.status === 'completed' ? 3 : journey.status === 'failed' ? -2 : 0;
+  const gateWeight = Number(journey.gatesSatisfied || 0) * 4;
+  const milestoneWeight = Number(journey.milestonesCompleted || 0) * 2;
+  const statusWeight =
+    journey.status === 'completed'
+      ? 3
+      : journey.status === 'degraded_planning'
+        ? 1
+        : journey.status === 'failed'
+          ? -2
+          : journey.status === 'blocked'
+            ? -1
+            : 0;
 
-  return requiredWeight + producedWeight + stepWeight + destructiveWeight + statusWeight;
+  return requiredWeight + producedWeight + stepWeight + destructiveWeight + gateWeight + milestoneWeight + statusWeight;
 }
 
 export function buildCriticalPaths(journeys, options = {}) {
@@ -22,6 +33,9 @@ export function buildCriticalPaths(journeys, options = {}) {
       requiredEntities: safeArray(journey.requiredEntities),
       producedEntities: safeArray(journey.producedEntities),
       stepCount: safeArray(journey.steps).length,
+      milestonesCompleted: Number(journey.milestonesCompleted || 0),
+      gatesSatisfied: Number(journey.gatesSatisfied || 0),
+      blockedReason: journey.blockedReason || '',
       score: scoreJourney(journey)
     }))
     .sort((a, b) => b.score - a.score)
@@ -46,7 +60,7 @@ function normalizeStep(step) {
 }
 
 export function buildE2ESpecs(journeys, entityRegistry, options = {}) {
-  const includeStatuses = new Set(options.includeStatuses || ['completed', 'discovered']);
+  const includeStatuses = new Set(options.includeStatuses || ['completed', 'discovered', 'degraded_planning']);
 
   const specs = safeArray(journeys)
     .filter((journey) => includeStatuses.has(journey.status || 'discovered'))
@@ -58,13 +72,35 @@ export function buildE2ESpecs(journeys, entityRegistry, options = {}) {
       entity: journey.entity,
       preconditions: {
         requiredEntities: safeArray(journey.requiredEntities),
-        satisfiedEntities: safeArray(journey.requiredEntities).filter((key) => entityRegistry?.latestValues?.[key])
+        satisfiedEntities: safeArray(journey.requiredEntities).filter((key) => entityRegistry?.latestValues?.[key]),
+        setupActions: [
+          Number(journey.gatesSatisfied || 0) > 0
+            ? `Satisfy ${journey.gatesSatisfied} gate prerequisite(s) before final CTA.`
+            : null,
+          journey.blockedReason && String(journey.blockedReason).startsWith('missing_entities:')
+            ? `Create prerequisite entities: ${String(journey.blockedReason).replace('missing_entities:', '')}`
+            : null
+        ].filter(Boolean)
       },
       steps: safeArray(journey.steps).map(normalizeStep),
       assertions: [
         {
           type: 'url_or_state_change',
           description: 'After each action, route or page state should change as expected.'
+        },
+        {
+          type: 'unlock_assertion',
+          description:
+            Number(journey.gatesSatisfied || 0) > 0
+              ? `Verify locked actions become enabled after satisfying ${journey.gatesSatisfied} prerequisite gate(s).`
+              : 'Verify final call-to-action is enabled before completion.'
+        },
+        {
+          type: 'repeat_count_assertion',
+          description:
+            Number(journey.milestonesCompleted || 0) > 0
+              ? `Verify repeated progression actions can be performed through ${journey.milestonesCompleted} milestone(s).`
+              : 'Verify repeated actions do not silently no-op.'
         }
       ]
     }));
@@ -135,6 +171,15 @@ export function buildCopyIssueHints(copyInventory, options = {}) {
     if (/[A-Z]{4,}/.test(text) && text.length > 12) {
       hints.push({
         kind: 'readability-tone',
+        text,
+        url: entry.url,
+        context: entry.context || ''
+      });
+    }
+
+    if (/(at least|minimum|required|remaining|left|step\\s+\\d+\\s+of\\s+\\d+)/i.test(text)) {
+      hints.push({
+        kind: 'gate-copy-friction',
         text,
         url: entry.url,
         context: entry.context || ''

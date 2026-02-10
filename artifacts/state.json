@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "createdAt": "2026-02-10T15:09:29.841Z",
   "lastRunAt": "2026-02-10T15:10:05.644Z",
   "lastCommand": "init",
@@ -15,6 +15,7 @@
     "completedJourneyCount": 0,
     "failedJourneyCount": 0,
     "blockedJourneyCount": 0,
+    "degradedJourneyCount": 0,
     "routeCoveragePct": 0
   }
 }

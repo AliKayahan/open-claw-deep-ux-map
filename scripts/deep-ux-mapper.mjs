@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import crypto from 'node:crypto';
 import { chromium } from 'playwright';
 import {
   appendJsonl,
@@ -27,9 +28,7 @@ import { buildCoverageFrontier, buildExpectedVsFoundReport } from './lib/expecta
 import {
   capturePageState,
   extractInteractiveElements,
-  inputSampleFor,
   isDestructiveCandidate,
-  mightBeFormInput,
   routeFromUrl,
   sameOrigin,
   screenshotName,
@@ -60,9 +59,15 @@ import {
   buildE2ESpecs,
   buildSmokeSuite
 } from './lib/artifact-builders.mjs';
+import { createAnthropicClient } from './lib/llm/anthropic-client.mjs';
+import { buildScreenContext, extractScreenDiagnostics } from './lib/llm/screen-packager.mjs';
+import { normalizePlannerPlan, validatePlannerPlan } from './lib/llm/planner-schema.mjs';
+import { collectFormCandidates, chooseFormCandidate, executeFormEpisode } from './lib/form-engine.mjs';
+import { detectGates, gateProgress, isGateSatisfied, selectGateActionHints } from './lib/gate-engine.mjs';
+import { createLoopGuard, prioritizeInteractions } from './lib/policy/curiosity-policy.mjs';
 
 const DEFAULT_CONFIG = {
-  version: 2,
+  version: 3,
   target: {
     baseUrl: 'https://app.example.com',
     loginUrl: 'https://app.example.com/login',
@@ -120,6 +125,42 @@ const DEFAULT_CONFIG = {
     waitAfterActionMs: 900,
     screenshot: true
   },
+  llm: {
+    provider: 'anthropic',
+    model: 'claude-3-5-sonnet-latest',
+    apiKeyEnv: 'ANTHROPIC_API_KEY',
+    maxTokens: 1500,
+    temperature: 0.2,
+    timeoutMs: 25000,
+    maxRetries: 2
+  },
+  planning: {
+    mode: 'llm-first',
+    maxActionsPerScreen: 8,
+    maxLoopIterationsPerGate: 8,
+    requirePlanSchemaValidation: true
+  },
+  forms: {
+    strategy: 'llm-generated',
+    maxFieldsPerForm: 14,
+    submitHeuristics: ['button', 'enter', 'blur']
+  },
+  gates: {
+    enabled: true,
+    maxSatisfyAttempts: 10,
+    countPatterns: [
+      '(?:at\\s+least|minimum\\s+of)\\s+(\\d+)\\s+([a-z][a-z\\- ]{1,30})',
+      'add\\s+(\\d+)\\s+([a-z][a-z\\- ]{1,30})',
+      '(\\d+)\\s+(?:remaining|left)\\b',
+      'step\\s+(\\d+)\\s+of\\s+(\\d+)'
+    ]
+  },
+  budgets: {
+    profile: 'aggressive',
+    maxJourneyMinutes: 15,
+    maxScreenVisitsPerJourney: 100,
+    maxRepeatedActionCount: 5
+  },
   semantics: {
     minConfidence: 0.45
   },
@@ -143,7 +184,7 @@ const DEFAULT_CONFIG = {
 };
 
 const DEFAULT_STATE = {
-  version: 2,
+  version: 3,
   createdAt: nowIso(),
   lastRunAt: null,
   lastCommand: null,
@@ -159,6 +200,7 @@ const DEFAULT_STATE = {
     completedJourneyCount: 0,
     failedJourneyCount: 0,
     blockedJourneyCount: 0,
+    degradedJourneyCount: 0,
     routeCoveragePct: 0
   }
 };
@@ -168,7 +210,7 @@ function normalizeStateShape(inputState) {
   return {
     ...DEFAULT_STATE,
     ...state,
-    version: 2,
+    version: 3,
     discovery: {
       ...DEFAULT_STATE.discovery,
       ...(state.discovery || {})
@@ -231,6 +273,10 @@ function pathsFromConfig(projectRoot, config) {
     featuresMd: path.join(root, 'features.md'),
     featureEvents: path.join(root, 'feature-events.jsonl'),
     journeyProgress: path.join(root, 'journey-progress.jsonl'),
+    llmDecisions: path.join(root, 'llm-decisions.jsonl'),
+    formLedger: path.join(root, 'form-ledger.jsonl'),
+    gateLedger: path.join(root, 'gate-ledger.jsonl'),
+    journeyMilestones: path.join(root, 'journey-milestones.jsonl'),
     expectedVsFound: path.join(root, 'expected-vs-found.json'),
     expectedVsFoundMd: path.join(root, 'expected-vs-found.md'),
     coverageFrontier: path.join(root, 'coverage-frontier.json'),
@@ -287,6 +333,26 @@ function loadConfig(configPath) {
       ...DEFAULT_CONFIG.mapping,
       ...(loaded.mapping || {})
     },
+    llm: {
+      ...DEFAULT_CONFIG.llm,
+      ...(loaded.llm || {})
+    },
+    planning: {
+      ...DEFAULT_CONFIG.planning,
+      ...(loaded.planning || {})
+    },
+    forms: {
+      ...DEFAULT_CONFIG.forms,
+      ...(loaded.forms || {})
+    },
+    gates: {
+      ...DEFAULT_CONFIG.gates,
+      ...(loaded.gates || {})
+    },
+    budgets: {
+      ...DEFAULT_CONFIG.budgets,
+      ...(loaded.budgets || {})
+    },
     semantics: {
       ...DEFAULT_CONFIG.semantics,
       ...(loaded.semantics || {})
@@ -333,6 +399,22 @@ function validateConfig(config) {
     errors.push('coverage.targetPct must be > 0 and <= 100');
   }
 
+  if (config.llm?.provider && config.llm.provider !== 'anthropic') {
+    errors.push('llm.provider currently supports only "anthropic"');
+  }
+
+  if (!['llm-first', 'heuristic-fallback'].includes(config.planning?.mode)) {
+    errors.push('planning.mode must be "llm-first" or "heuristic-fallback"');
+  }
+
+  if (Number(config.planning?.maxActionsPerScreen) <= 0) {
+    errors.push('planning.maxActionsPerScreen must be > 0');
+  }
+
+  if (Number(config.gates?.maxSatisfyAttempts) <= 0) {
+    errors.push('gates.maxSatisfyAttempts must be > 0');
+  }
+
   return errors;
 }
 
@@ -351,6 +433,10 @@ function initializeWorkspace(paths, configPath, config) {
   ensureFile(paths.journeyCandidates, '');
   ensureFile(paths.featureEvents, '');
   ensureFile(paths.journeyProgress, '');
+  ensureFile(paths.llmDecisions, '');
+  ensureFile(paths.formLedger, '');
+  ensureFile(paths.gateLedger, '');
+  ensureFile(paths.journeyMilestones, '');
   ensureFile(paths.routeUniverse, `${JSON.stringify(createRouteUniverse(), null, 2)}\n`);
   ensureFile(paths.entityRegistry, `${JSON.stringify(createEntityRegistry(), null, 2)}\n`);
   ensureFile(paths.journeyGraph, `${JSON.stringify({ version: 2, nodes: [], edges: [] }, null, 2)}\n`);
@@ -511,6 +597,15 @@ function shouldSkipByText(action, config) {
 }
 
 async function locateAction(page, action) {
+  const plannedTarget = action?.target || {};
+
+  if (plannedTarget.selector) {
+    const byPlanSelector = page.locator(plannedTarget.selector).first();
+    if (await byPlanSelector.isVisible().catch(() => false)) {
+      return byPlanSelector;
+    }
+  }
+
   if (action.selector) {
     const bySelector = page.locator(action.selector).first();
     if (await bySelector.isVisible().catch(() => false)) {
@@ -518,11 +613,11 @@ async function locateAction(page, action) {
     }
   }
 
-  const labels = [action.text, action.ariaLabel, action.title].filter(Boolean);
+  const labels = [plannedTarget.label, plannedTarget.contains, action.text, action.ariaLabel, action.title].filter(Boolean);
   for (const label of labels) {
     const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const byButtonText = page
-      .locator('button, [role="button"], a, [role="menuitem"], [role="tab"]')
+      .locator('button, [role="button"], a, [role="menuitem"], [role="tab"], input, textarea, select')
       .filter({ hasText: new RegExp(escaped, 'i') })
       .first();
 
@@ -563,17 +658,43 @@ async function performAction(page, action, config) {
     return { performed: false, reason: 'skip-text' };
   }
 
-  if (action.tagName === 'select') {
+  const actionType = action?.actionType || '';
+  if (action.tagName === 'select' || actionType === 'select') {
     const switched = await selectAlternateValue(locator);
     return switched
       ? { performed: true, kind: 'select', reason: 'selected-alternate-option' }
       : { performed: false, reason: 'select-no-options' };
   }
 
-  if (mightBeFormInput(action)) {
-    const sample = inputSampleFor(action);
-    await locator.fill(sample, { timeout: config.browser.actionTimeoutMs });
-    return { performed: true, kind: 'fill', sample };
+  if (actionType === 'toggle') {
+    const toggled = await locator.evaluate((node) => {
+      if (!(node instanceof HTMLElement)) {
+        return false;
+      }
+      if (node instanceof HTMLInputElement && ['checkbox', 'radio'].includes(node.type)) {
+        node.click();
+        return true;
+      }
+      node.click();
+      return true;
+    }).catch(() => false);
+
+    return toggled ? { performed: true, kind: 'toggle' } : { performed: false, reason: 'toggle-failed' };
+  }
+
+  const inputType = String(action.type || '').toLowerCase();
+  if (action.tagName === 'input' && ['checkbox', 'radio'].includes(inputType) && actionType !== 'fill') {
+    await locator.click({ timeout: config.browser.actionTimeoutMs });
+    return { performed: true, kind: 'toggle' };
+  }
+
+  if (['fill'].includes(actionType) || action.tagName === 'input' || action.tagName === 'textarea') {
+    const plannedValue =
+      action?.inputValue ??
+      action?.inputValuePolicy?.value ??
+      `test-${Date.now().toString(36).slice(-4)}`;
+    await locator.fill(String(plannedValue), { timeout: config.browser.actionTimeoutMs });
+    return { performed: true, kind: 'fill', sample: String(plannedValue).slice(0, 80) };
   }
 
   await locator.click({ timeout: config.browser.actionTimeoutMs });
@@ -788,6 +909,241 @@ async function probeActionTransition(params) {
   return edge;
 }
 
+function buildHeuristicPlan(screenContext, interactions, gates, options = {}) {
+  const prioritized = prioritizeInteractions(interactions, {
+    visitedSignatures: options.visitedSignatures || new Set(),
+    entityHint: gates[0]?.entityHint || ''
+  });
+
+  const toTarget = (action) => ({
+    selector: action.selector,
+    label: action.text || action.ariaLabel || action.title || '',
+    contains: action.contextText || ''
+  });
+
+  const priorityActions = [];
+
+  for (const gate of gates.slice(0, 2)) {
+    const candidates = selectGateActionHints(gate, prioritized);
+    if (candidates[0]) {
+      priorityActions.push({
+        actionType: gate.gateType === 'wizard_step' ? 'next-step' : 'add-row',
+        target: toTarget(candidates[0]),
+        repeatPolicy: {
+          times: 1,
+          max: Math.max(1, Math.min(6, Number(gate.targetCount || 3))),
+          untilCondition: `gate:${gate.gateType}`
+        }
+      });
+    }
+  }
+
+  for (const action of prioritized.slice(0, 4)) {
+    const actionText = normalizeText(`${action.text} ${action.ariaLabel} ${action.title}`);
+    const actionType = action.tagName === 'select'
+      ? 'select'
+      : action.tagName === 'input' || action.tagName === 'textarea'
+        ? 'fill'
+        : /next|continue|start/.test(actionText)
+          ? 'next-step'
+          : /menu|more|ellipsis|options/.test(actionText)
+            ? 'open-menu'
+            : 'click';
+
+    priorityActions.push({
+      actionType,
+      target: toTarget(action),
+      repeatPolicy: {
+        times: 1,
+        max: 1,
+        untilCondition: ''
+      }
+    });
+  }
+
+  return normalizePlannerPlan({
+    screenIntent: `heuristic:${screenContext.headline || screenContext.title || 'screen'}`,
+    gates,
+    priorityActions,
+    expectedOutcome: 'advance-flow',
+    fallbackAction: priorityActions[0] || null
+  });
+}
+
+function resolvePlannedAction(planAction, interactions) {
+  const normalizedLabel = normalizeText(
+    `${planAction?.target?.label || ''} ${planAction?.target?.contains || ''}`
+  );
+
+  if (planAction?.target?.selector) {
+    const bySelector = safeArray(interactions).find((item) => item.selector === planAction.target.selector);
+    if (bySelector) {
+      return {
+        ...bySelector,
+        actionType: planAction.actionType,
+        repeatPolicy: planAction.repeatPolicy || { times: 1, max: 1 },
+        inputValuePolicy: planAction.inputValuePolicy || {}
+      };
+    }
+  }
+
+  if (normalizedLabel) {
+    const byLabel = safeArray(interactions).find((item) => {
+      const haystack = normalizeText(`${item.text} ${item.ariaLabel} ${item.title} ${item.contextText}`);
+      return haystack.includes(normalizedLabel);
+    });
+    if (byLabel) {
+      return {
+        ...byLabel,
+        actionType: planAction.actionType,
+        repeatPolicy: planAction.repeatPolicy || { times: 1, max: 1 },
+        inputValuePolicy: planAction.inputValuePolicy || {}
+      };
+    }
+  }
+
+  const fallback = safeArray(interactions)[0];
+  if (!fallback) {
+    return null;
+  }
+
+  return {
+    ...fallback,
+    actionType: planAction.actionType || 'click',
+    repeatPolicy: planAction.repeatPolicy || { times: 1, max: 1 },
+    inputValuePolicy: planAction.inputValuePolicy || {}
+  };
+}
+
+function applyPlannedValuePolicy(action, screenContext) {
+  if (!action) {
+    return action;
+  }
+
+  if (action.actionType !== 'fill') {
+    return action;
+  }
+
+  const policyValue = action.inputValuePolicy?.value;
+  if (policyValue != null && policyValue !== '') {
+    return {
+      ...action,
+      inputValue: String(policyValue)
+    };
+  }
+
+  const label = normalizeText(`${action.text} ${action.ariaLabel} ${action.placeholder}`);
+  let value = `sample-${Date.now().toString(36).slice(-5)}`;
+
+  if (/email/.test(label)) {
+    value = `mapbot+${Date.now().toString(36).slice(-5)}@example.com`;
+  } else if (/name|title/.test(label)) {
+    value = `Map Item ${Date.now().toString(36).slice(-4)}`;
+  } else if (/search|filter/.test(label)) {
+    value = 'test criteria';
+  } else if (/password/.test(label)) {
+    value = 'Passw0rd!';
+  } else if (/company|workspace/.test(label)) {
+    value = `Workspace ${Date.now().toString(36).slice(-4)}`;
+  }
+
+  if (screenContext?.journey?.entity && /requirement|item|product/.test(screenContext.journey.entity)) {
+    value = `${screenContext.journey.entity} ${Date.now().toString(36).slice(-4)}`;
+  }
+
+  return {
+    ...action,
+    inputValue: value
+  };
+}
+
+function recordMilestone(paths, payload) {
+  appendJsonl(paths.journeyMilestones, {
+    at: nowIso(),
+    ...payload
+  });
+}
+
+async function buildPlanFromScreen(params) {
+  const {
+    plannerClient,
+    config,
+    screenContext,
+    interactions,
+    gates,
+    paths,
+    runMeta
+  } = params;
+
+  let plan = null;
+  let degradedPlanning = false;
+  let llmError = '';
+  let llmUsage = {};
+  let source = 'heuristic';
+  let requestHash = '';
+
+  if (config.planning.mode === 'llm-first') {
+    if (!plannerClient?.available) {
+      degradedPlanning = true;
+      llmError = `missing_api_key:${config.llm.apiKeyEnv}`;
+    } else {
+      const llmResult = await plannerClient.generateScreenPlan(screenContext);
+      requestHash = llmResult.requestHash || crypto.createHash('sha256').update(screenContext.screenDigest || '').digest('hex');
+      llmUsage = llmResult.usage || {};
+
+      if (llmResult.ok) {
+        const validation = validatePlannerPlan(llmResult.json, {
+          requirePlanSchemaValidation: config.planning.requirePlanSchemaValidation
+        });
+
+        if (validation.ok) {
+          plan = validation.plan;
+          source = 'llm';
+        } else {
+          llmError = `invalid_plan_schema:${validation.errors.join('; ')}`;
+          if (config.planning.requirePlanSchemaValidation) {
+            degradedPlanning = true;
+          }
+        }
+      } else {
+        llmError = llmResult.error || 'llm-plan-error';
+        degradedPlanning = true;
+      }
+    }
+  }
+
+  if (!plan) {
+    plan = buildHeuristicPlan(screenContext, interactions, gates, {
+      visitedSignatures: params.visitedSignatures
+    });
+    source = source === 'llm' ? source : 'heuristic';
+  }
+
+  appendJsonl(paths.llmDecisions, {
+    at: nowIso(),
+    runId: runMeta.runId,
+    journeyId: runMeta.journeyId,
+    url: screenContext.url,
+    source,
+    requestHash,
+    degradedPlanning,
+    llmError,
+    usage: llmUsage,
+    planSummary: {
+      screenIntent: plan.screenIntent,
+      actionCount: safeArray(plan.priorityActions).length,
+      gateCount: safeArray(plan.gates).length
+    }
+  });
+
+  return {
+    plan,
+    source,
+    degradedPlanning,
+    llmError
+  };
+}
+
 function mergeJourneyCandidates(existing, generated) {
   const byKey = new Map();
   const combined = [...safeArray(existing), ...safeArray(generated)];
@@ -921,6 +1277,7 @@ async function runDiscovery(config, paths) {
   ensureDir(path.join(runDir, 'screenshots'));
 
   const browser = await launchBrowser(config);
+  const plannerClient = createAnthropicClient(config.llm);
   await ensureAuthStorageState(browser, config, paths);
 
   let knowledge = createKnowledgeBase(readJson(paths.knowledge, createKnowledgeBase()));
@@ -1003,6 +1360,55 @@ async function runDiscovery(config, paths) {
         context: contextName,
         text: [state.title, state.headline].filter(Boolean).join(' | ')
       });
+
+      const diagnostics = await extractScreenDiagnostics(page);
+      const screenContext = buildScreenContext({
+        state,
+        interactions: [],
+        diagnostics,
+        routeTemplate: template,
+        entityRegistry,
+        recentEvents: [],
+        journey: null
+      });
+      const formCandidates = await collectFormCandidates(page, { maxForms: 3 });
+      const form = chooseFormCandidate(formCandidates);
+      if (form && safeArray(form.fields).length > 0) {
+        const formOutcome = await executeFormEpisode({
+          page,
+          form,
+          plannerClient,
+          screenContext,
+          config,
+          ledgerPath: paths.formLedger,
+          runMeta: {
+            runId,
+            journeyId: `discovery-${contextName}`
+          },
+          appendJsonl
+        });
+
+        if (formOutcome.ok) {
+          const afterFormState = await capturePageState(page);
+          routeUniverse = upsertRouteObservation(routeUniverse, afterFormState.url, {
+            context: contextName,
+            state: 'visited'
+          });
+          entityRegistry = upsertEntityValues(entityRegistry, extractEntityValuesFromUrl(afterFormState.url), {
+            source: `discovery-form:${contextName}`
+          });
+          if (
+            shouldQueueUrl(afterFormState.url, config.target.baseUrl, config) &&
+            stateItem.depth < config.discovery.maxDepth
+          ) {
+            queue.push({
+              url: afterFormState.url,
+              depth: stateItem.depth + 1,
+              trail: stateItem.trail
+            });
+          }
+        }
+      }
 
       const interactions = await extractInteractiveElements(page, {
         maxElements: config.discovery.maxActionsPerState
@@ -1272,11 +1678,258 @@ async function executeDestructiveBranches(page, step, config, contextInfo) {
   return outcomes;
 }
 
+async function runPlannedScreenProgression(params) {
+  const {
+    page,
+    config,
+    paths,
+    plannerClient,
+    journey,
+    shared,
+    runMeta,
+    screenshotDir,
+    contextName,
+    recentEvents
+  } = params;
+
+  const visitedSignatures = new Set();
+  const loopGuard = createLoopGuard({
+    maxRepeatedActionCount: config.budgets.maxRepeatedActionCount,
+    maxNoopStreak: Math.max(2, Math.ceil(config.planning.maxActionsPerScreen / 2))
+  });
+
+  const milestones = [];
+  const localFeatures = [];
+  const edges = [];
+  let gatesSatisfied = 0;
+  let blockedReason = '';
+  let degradedPlanningUsed = false;
+
+  for (let loopIndex = 0; loopIndex < config.planning.maxActionsPerScreen; loopIndex += 1) {
+    const beforeState = await capturePageState(page);
+    const interactions = await extractInteractiveElements(page, {
+      maxElements: config.discovery.maxActionsPerState
+    });
+    const diagnostics = await extractScreenDiagnostics(page);
+    const routeTemplate = routeTemplateFromUrl(beforeState.url).template;
+
+    const screenContext = buildScreenContext({
+      state: beforeState,
+      interactions,
+      diagnostics,
+      routeTemplate,
+      entityRegistry: shared.entityRegistry,
+      recentEvents,
+      journey
+    });
+
+    const gates = config.gates.enabled ? detectGates({ state: beforeState, diagnostics, interactions }, config) : [];
+    for (const gate of gates) {
+      shared.copyInventory = addCopyEntry(shared.copyInventory, {
+        url: beforeState.url,
+        context: contextName,
+        text: gate.signal
+      });
+    }
+
+    const formCandidates = await collectFormCandidates(page, { maxForms: 4 });
+    const form = chooseFormCandidate(formCandidates);
+
+    if (form && safeArray(form.fields).length > 0) {
+      const formOutcome = await executeFormEpisode({
+        page,
+        form,
+        plannerClient,
+        screenContext,
+        config,
+        ledgerPath: paths.formLedger,
+        runMeta,
+        appendJsonl
+      });
+
+      if (formOutcome.ok) {
+        milestones.push({
+          kind: 'form-episode',
+          fieldsFilled: formOutcome.fieldsFilled,
+          submitted: formOutcome.submitted
+        });
+
+        recordMilestone(paths, {
+          runId: runMeta.runId,
+          journeyId: runMeta.journeyId,
+          kind: 'form-episode',
+          url: beforeState.url,
+          details: formOutcome
+        });
+
+        const afterState = await capturePageState(page);
+        const changed = beforeState.fingerprint !== afterState.fingerprint || beforeState.url !== afterState.url;
+        loopGuard.register(`form:${form.formSelector}`, changed);
+      }
+    }
+
+    const planOutcome = await buildPlanFromScreen({
+      plannerClient,
+      config,
+      screenContext,
+      interactions,
+      gates,
+      paths,
+      runMeta,
+      visitedSignatures
+    });
+
+    degradedPlanningUsed = degradedPlanningUsed || planOutcome.degradedPlanning;
+    const plan = planOutcome.plan;
+
+    let executedAny = false;
+
+    for (const planAction of safeArray(plan.priorityActions).slice(0, config.planning.maxLoopIterationsPerGate)) {
+      const resolved = resolvePlannedAction(planAction, interactions);
+      if (!resolved) {
+        continue;
+      }
+
+      const action = applyPlannedValuePolicy(resolved, screenContext);
+      const signature = action.key || `${action.selector}|${action.actionType || ''}`;
+      if (visitedSignatures.has(signature) && (planAction.repeatPolicy?.max || 1) <= 1) {
+        continue;
+      }
+
+      visitedSignatures.add(signature);
+      const repeatMax = Math.max(
+        1,
+        Math.min(
+          12,
+          Number(config.gates.maxSatisfyAttempts || 10),
+          Number(planAction.repeatPolicy?.max || planAction.repeatPolicy?.times || 1)
+        )
+      );
+
+      for (let repeatIndex = 0; repeatIndex < repeatMax; repeatIndex += 1) {
+        const edge = await probeActionTransition({
+          page,
+          stateItem: { trail: [] },
+          beforeState: await capturePageState(page),
+          action,
+          config,
+          runOutputDir: screenshotDir,
+          minConfidence: config.semantics.minConfidence,
+          learningsPath: paths.learnings,
+          lockPath: paths.lock,
+          runId: runMeta.runId,
+          contextName
+        });
+
+        edges.push(edge);
+        appendJsonl(paths.edges, edge);
+        executedAny = executedAny || edge.actionResult?.performed;
+
+        shared.entityRegistry = upsertEntityValues(shared.entityRegistry, edge.extractedEntities || {}, {
+          source: `planner:${journey.id}`
+        });
+        shared.routeUniverse = upsertRouteObservation(shared.routeUniverse, edge.from.url, {
+          context: contextName,
+          state: 'executed'
+        });
+        shared.routeUniverse = upsertRouteObservation(shared.routeUniverse, edge.to.url, {
+          context: contextName,
+          state: edge.changed ? 'visited' : 'observed'
+        });
+        shared.knowledge = updateKnowledgeBase(shared.knowledge, edge.semantic, { url: edge.from.url });
+
+        const feature = featureFromEdge(edge);
+        feature.journeyId = journey.id;
+        localFeatures.push(feature);
+
+        const event = {
+          at: nowIso(),
+          kind: edge.actionResult?.kind || edge.action?.actionType || 'click',
+          actionLabel: edge.semantic?.label || action.text || action.ariaLabel || action.selector,
+          entity: edge.semantic?.entity || journey.entity,
+          changed: edge.changed
+        };
+        recentEvents.push(event);
+
+        const gateChecks = detectGates(
+          {
+            state: await capturePageState(page),
+            diagnostics: await extractScreenDiagnostics(page),
+            interactions: await extractInteractiveElements(page, { maxElements: 30 })
+          },
+          config
+        );
+        for (const gate of gates) {
+          const progressCount = gateProgress(gate, { interactions, events: recentEvents });
+          const satisfied = isGateSatisfied(gate, progressCount);
+          appendJsonl(paths.gateLedger, {
+            at: nowIso(),
+            runId: runMeta.runId,
+            journeyId: runMeta.journeyId,
+            url: page.url(),
+            gate,
+            progressCount,
+            satisfied
+          });
+
+          if (satisfied) {
+            gatesSatisfied += 1;
+            recordMilestone(paths, {
+              runId: runMeta.runId,
+              journeyId: runMeta.journeyId,
+              kind: 'gate-satisfied',
+              url: page.url(),
+              details: {
+                gate,
+                progressCount
+              }
+            });
+          }
+        }
+
+        const guard = loopGuard.register(signature, edge.changed);
+        if (guard.shouldStop) {
+          blockedReason = guard.reason;
+          break;
+        }
+
+        if (safeArray(gateChecks).length === 0 && edge.changed) {
+          break;
+        }
+      }
+
+      if (blockedReason) {
+        break;
+      }
+    }
+
+    if (!executedAny) {
+      if (gates.length > 0) {
+        blockedReason = blockedReason || `gate_unresolved:${gates[0].gateType}`;
+      }
+      break;
+    }
+
+    if (blockedReason) {
+      break;
+    }
+  }
+
+  return {
+    edges,
+    localFeatures,
+    milestones,
+    gatesSatisfied,
+    blockedReason,
+    degradedPlanningUsed
+  };
+}
+
 function missingEntitiesForJourney(journey, entityRegistry) {
   return safeArray(journey.requiredEntities).filter((key) => !entityRegistry?.latestValues?.[key]);
 }
 
-async function executeJourney(browser, config, paths, journey, shared) {
+async function executeJourney(browser, config, paths, journey, shared, plannerClient) {
   const runId = `journey-${journey.id}-${Date.now()}`;
   const runDir = path.join(paths.runs, runId);
   const screenshotDir = path.join(runDir, 'screenshots');
@@ -1293,6 +1946,10 @@ async function executeJourney(browser, config, paths, journey, shared) {
   const localFeatures = [];
   const branchFindings = [];
   const events = [];
+  let milestonesCompleted = 0;
+  let gatesSatisfied = 0;
+  let blockedReason = '';
+  let degradedPlanning = false;
 
   let completedSteps = 0;
   let failed = false;
@@ -1325,6 +1982,28 @@ async function executeJourney(browser, config, paths, journey, shared) {
         context: journey.context || 'auth',
         state: 'visited'
       });
+
+      const progression = await runPlannedScreenProgression({
+        page,
+        config,
+        paths,
+        plannerClient,
+        journey,
+        shared,
+        runMeta: {
+          runId,
+          journeyId: journey.id
+        },
+        screenshotDir,
+        contextName: journey.context || 'auth',
+        recentEvents: events
+      });
+
+      degradedPlanning = degradedPlanning || progression.degradedPlanningUsed;
+      blockedReason = blockedReason || progression.blockedReason;
+      milestonesCompleted += safeArray(progression.milestones).length;
+      gatesSatisfied += Number(progression.gatesSatisfied || 0);
+      localFeatures.push(...safeArray(progression.localFeatures));
 
       const before = await capturePageState(page);
 
@@ -1361,7 +2040,7 @@ async function executeJourney(browser, config, paths, journey, shared) {
         state: edge.changed ? 'executed' : 'observed'
       });
 
-      localFeatures.push({
+      const feature = {
         id: `feature-${slugify(`${journey.id}-${step.selector || step.label}-${Date.now()}`)}`,
         discoveredAt: nowIso(),
         journeyId: journey.id,
@@ -1378,14 +2057,18 @@ async function executeJourney(browser, config, paths, journey, shared) {
           from: before.url,
           to: after.url || page.url()
         }
-      });
+      };
+      localFeatures.push(feature);
 
       events.push({
         step,
         status: 'ok',
         fromUrl: before.url,
         toUrl: after.url || page.url(),
-        producedEntities: edge.producedEntityKeys
+        producedEntities: edge.producedEntityKeys,
+        actionLabel: feature.actionLabel,
+        kind: edge.actionResult?.kind || 'click',
+        entity: feature.entity
       });
 
       completedSteps += 1;
@@ -1409,6 +2092,7 @@ async function executeJourney(browser, config, paths, journey, shared) {
       }
     } catch (error) {
       failed = true;
+      blockedReason = blockedReason || `step_error:${error.message.slice(0, 120)}`;
       events.push({
         step,
         status: 'error',
@@ -1418,13 +2102,19 @@ async function executeJourney(browser, config, paths, journey, shared) {
     }
   }
 
-  const status = blocked ? 'blocked' : failed ? 'failed' : completedSteps > 0 ? 'completed' : 'no-op';
+  let status = blocked ? 'blocked' : failed ? 'failed' : completedSteps > 0 ? 'completed' : 'no-op';
+  if (degradedPlanning && status === 'completed') {
+    status = 'degraded_planning';
+  }
+  if (status === 'no-op' && blockedReason) {
+    status = 'blocked';
+  }
 
   await appendLearning(
     paths.learnings,
     paths.lock,
     status === 'completed' ? 'Confirmed behaviors' : 'Open hypotheses',
-    `Journey ${journey.id} finished with status=${status} and completedSteps=${completedSteps}`,
+    `Journey ${journey.id} finished with status=${status}, completedSteps=${completedSteps}, milestones=${milestonesCompleted}, gatesSatisfied=${gatesSatisfied}`,
     { runId, journeyId: journey.id, url: journey.entryUrl }
   );
 
@@ -1433,6 +2123,10 @@ async function executeJourney(browser, config, paths, journey, shared) {
     journeyId: journey.id,
     status,
     completedSteps,
+    milestonesCompleted,
+    gatesSatisfied,
+    blockedReason,
+    degradedPlanning,
     branchFindings,
     events
   });
@@ -1460,6 +2154,10 @@ async function executeJourney(browser, config, paths, journey, shared) {
     journeyId: journey.id,
     status,
     completedSteps,
+    milestonesCompleted,
+    gatesSatisfied,
+    blockedReason,
+    degradedPlanning,
     localFeatures,
     branchFindings,
     missingEntities: status === 'blocked' ? missingEntitiesForJourney(journey, shared.entityRegistry) : []
@@ -1491,19 +2189,21 @@ async function runInPool(items, concurrency, worker, onResult = null) {
 async function runJourneyMapping(config, paths) {
   const browser = await launchBrowser(config);
   await ensureAuthStorageState(browser, config, paths);
+  const plannerClient = createAnthropicClient(config.llm);
 
   const journeysPayload = readJson(paths.journeys, { version: 2, journeys: [] });
   const journeys = safeArray(journeysPayload.journeys);
 
   if (!journeys.length) {
     await browser.close();
-    return { completed: 0, failed: 0, blocked: 0, features: 0 };
+    return { completed: 0, degraded: 0, failed: 0, blocked: 0, features: 0 };
   }
 
   const shared = {
     knowledge: createKnowledgeBase(readJson(paths.knowledge, createKnowledgeBase())),
     entityRegistry: createEntityRegistry(readJson(paths.entityRegistry, createEntityRegistry())),
-    routeUniverse: createRouteUniverse(readJson(paths.routeUniverse, createRouteUniverse()))
+    routeUniverse: createRouteUniverse(readJson(paths.routeUniverse, createRouteUniverse())),
+    copyInventory: createCopyInventory(readJson(paths.copyInventory, createCopyInventory()))
   };
 
   const pending = [...journeys];
@@ -1528,6 +2228,9 @@ async function runJourneyMapping(config, paths) {
       status: result.status,
       depth,
       completedSteps: result.completedSteps || 0,
+      milestonesCompleted: Number(result.milestonesCompleted || 0),
+      gatesSatisfied: Number(result.gatesSatisfied || 0),
+      blockedReason: result.blockedReason || '',
       start: startPoint,
       end: endPoint,
       missingEntities: safeArray(result.missingEntities)
@@ -1548,6 +2251,10 @@ async function runJourneyMapping(config, paths) {
           journeyId: journey.id,
           status: 'blocked',
           completedSteps: 0,
+          milestonesCompleted: 0,
+          gatesSatisfied: 0,
+          blockedReason: `missing_entities:${missingEntitiesForJourney(journey, shared.entityRegistry).join(',')}`,
+          degradedPlanning: false,
           localFeatures: [],
           branchFindings: [],
           missingEntities: missingEntitiesForJourney(journey, shared.entityRegistry)
@@ -1562,7 +2269,7 @@ async function runJourneyMapping(config, paths) {
     const batchResults = await runInPool(
       batch,
       config.mapping.concurrency,
-      (journey) => executeJourney(browser, config, paths, journey, shared),
+      (journey) => executeJourney(browser, config, paths, journey, shared, plannerClient),
       (journey, result) => emitJourneyProgress(journey, result)
     );
 
@@ -1597,7 +2304,11 @@ async function runJourneyMapping(config, paths) {
       ...journey,
       status: result.status,
       mappedAt: nowIso(),
-      lastMissingEntities: missing
+      lastMissingEntities: missing,
+      milestonesCompleted: Number(result.milestonesCompleted || 0),
+      gatesSatisfied: Number(result.gatesSatisfied || 0),
+      blockedReason: result.blockedReason || '',
+      degradedPlanning: Boolean(result.degradedPlanning)
     };
   });
 
@@ -1607,12 +2318,12 @@ async function runJourneyMapping(config, paths) {
   const criticalPaths = buildCriticalPaths(updatedJourneys);
   const e2eSpecs = buildE2ESpecs(updatedJourneys, shared.entityRegistry);
   const smokeSuite = buildSmokeSuite(e2eSpecs, criticalPaths);
-  const copyInventory = createCopyInventory(readJson(paths.copyInventory, createCopyInventory()));
-  const copyIssues = buildCopyIssueHints(copyInventory);
+  const copyIssues = buildCopyIssueHints(shared.copyInventory);
 
   writeJson(paths.knowledge, shared.knowledge);
   writeJson(paths.entityRegistry, shared.entityRegistry);
   writeJson(paths.routeUniverse, shared.routeUniverse);
+  writeJson(paths.copyInventory, shared.copyInventory);
   writeJson(paths.features, { version: 2, generatedAt: nowIso(), features: mergedFeatures });
   writeJson(paths.journeys, { version: 2, generatedAt: nowIso(), journeys: updatedJourneys });
   writeJson(paths.expectedVsFound, expectedVsFound);
@@ -1651,6 +2362,7 @@ async function runJourneyMapping(config, paths) {
   }
 
   const completed = results.filter((item) => item.status === 'completed').length;
+  const degraded = results.filter((item) => item.status === 'degraded_planning').length;
   const failed = results.filter((item) => item.status === 'failed').length;
   const blocked = results.filter((item) => item.status === 'blocked').length;
 
@@ -1661,12 +2373,14 @@ async function runJourneyMapping(config, paths) {
       completedJourneyCount: completed,
       failedJourneyCount: failed,
       blockedJourneyCount: blocked,
+      degradedJourneyCount: degraded,
       routeCoveragePct: routeCoverage.coveragePct
     }
   });
 
   return {
     completed,
+    degraded,
     failed,
     blocked,
     features: mappedFeatures.length,
@@ -1689,6 +2403,7 @@ function statusSummary(paths) {
     metrics: {
       journeysTotal: journeys.length,
       journeysCompleted: journeys.filter((journey) => journey.status === 'completed').length,
+      journeysDegradedPlanning: journeys.filter((journey) => journey.status === 'degraded_planning').length,
       journeysFailed: journeys.filter((journey) => journey.status === 'failed').length,
       journeysBlocked: journeys.filter((journey) => journey.status === 'blocked').length,
       featuresTotal: features.length,
@@ -1711,7 +2426,11 @@ function statusSummary(paths) {
       smokeSuite: paths.smokeSuite,
       copyInventory: paths.copyInventory,
       copyIssues: paths.copyIssues,
-      journeyProgress: paths.journeyProgress
+      journeyProgress: paths.journeyProgress,
+      llmDecisions: paths.llmDecisions,
+      formLedger: paths.formLedger,
+      gateLedger: paths.gateLedger,
+      journeyMilestones: paths.journeyMilestones
     }
   };
 

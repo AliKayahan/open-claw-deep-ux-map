@@ -10,7 +10,8 @@
     "discover": "node scripts/deep-ux-mapper.mjs discover",
     "map": "node scripts/deep-ux-mapper.mjs map",
     "run": "node scripts/deep-ux-mapper.mjs run",
-    "status": "node scripts/deep-ux-mapper.mjs status"
+    "status": "node scripts/deep-ux-mapper.mjs status",
+    "test": "node --test tests/*.test.mjs tests/integration/*.test.mjs"
   },
   "dependencies": {
     "playwright": "^1.51.1"

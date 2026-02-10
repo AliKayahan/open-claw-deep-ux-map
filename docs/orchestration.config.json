@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "target": {
     "baseUrl": "https://app.example.com",
     "loginUrl": "https://app.example.com/login",
@@ -84,6 +84,46 @@
     "maxJourneySteps": 40,
     "waitAfterActionMs": 900,
     "screenshot": true
+  },
+  "llm": {
+    "provider": "anthropic",
+    "model": "claude-3-5-sonnet-latest",
+    "apiKeyEnv": "ANTHROPIC_API_KEY",
+    "maxTokens": 1500,
+    "temperature": 0.2,
+    "timeoutMs": 25000,
+    "maxRetries": 2
+  },
+  "planning": {
+    "mode": "llm-first",
+    "maxActionsPerScreen": 8,
+    "maxLoopIterationsPerGate": 8,
+    "requirePlanSchemaValidation": true
+  },
+  "forms": {
+    "strategy": "llm-generated",
+    "maxFieldsPerForm": 14,
+    "submitHeuristics": [
+      "button",
+      "enter",
+      "blur"
+    ]
+  },
+  "gates": {
+    "enabled": true,
+    "maxSatisfyAttempts": 10,
+    "countPatterns": [
+      "(?:at\\s+least|minimum\\s+of)\\s+(\\d+)\\s+([a-z][a-z\\- ]{1,30})",
+      "add\\s+(\\d+)\\s+([a-z][a-z\\- ]{1,30})",
+      "(\\d+)\\s+(?:remaining|left)\\b",
+      "step\\s+(\\d+)\\s+of\\s+(\\d+)"
+    ]
+  },
+  "budgets": {
+    "profile": "aggressive",
+    "maxJourneyMinutes": 15,
+    "maxScreenVisitsPerJourney": 100,
+    "maxRepeatedActionCount": 5
   },
   "semantics": {
     "minConfidence": 0.45

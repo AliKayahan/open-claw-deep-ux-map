@@ -8,14 +8,17 @@ It is designed for:
 - query-param and ID-dependent routes (`userId`, `workspaceId`, `specificationId`, etc.)
 - reusable artifacts for E2E generation, smoke testing, critical-path analysis, and copy audits
 
-## What changed in v2
+## What changed in v3
 
 - Automatic semantic journey enumeration from runtime behavior (UI + network).
 - Fresh Playwright context per journey to avoid long-session context collapse.
 - Runtime entity registry that captures generated IDs and reuses them in dependent routes.
 - Route universe + dependency-aware journey ordering (journeys that need IDs wait until producers run).
+- LLM-first planning (Anthropic) with strict action-plan schema validation and heuristic fallback.
+- Stateful form episodes (fill/validate/submit) to unlock downstream actions.
+- Gate detection/satisfaction loops for count and wizard prerequisites.
 - Branch handling for destructive actions: `Cancel` then `Confirm` (when enabled).
-- Real-time per-journey progress events (stdout + `journey-progress.jsonl`) with name, depth, start, end, and status.
+- Real-time per-journey progress events (stdout + `journey-progress.jsonl`) with name, depth, start, end, milestones, and gate stats.
 - Persistent cross-run learning in `artifacts/learnings.md`.
 
 ## Install
@@ -41,6 +44,13 @@ Recommended:
 - tune `contexts` to include guest/auth entry points
 - keep OTP enabled for email-code login flows
 - raise `discovery.maxStates` and `discovery.maxDepth` for deeper maps
+- set `ANTHROPIC_API_KEY` for LLM-first planning; without it the mapper falls back and marks `degraded_planning`
+
+LLM env:
+
+```bash
+export ANTHROPIC_API_KEY=\"<your-key>\"
+```
 
 ## Commands
 
@@ -77,6 +87,10 @@ Core outputs:
 - `smoke-suite.json`: prioritized smoke checks
 - `copy-inventory.json` + `copy-issues.json`: UX copy inventory and issue hints
 - `journey-progress.jsonl`: append-only per-journey completion events for live monitoring
+- `llm-decisions.jsonl`: LLM plan/fallback decisions with usage and schema status
+- `form-ledger.jsonl`: form fill/submit traces and generated values
+- `gate-ledger.jsonl`: gate detection and satisfaction attempts
+- `journey-milestones.jsonl`: step-level unlock milestones
 - `expected-vs-found.json` / `expected-vs-found.md`: inferred capability gaps
 - `coverage-frontier.json`: mapping progress + route coverage against target
 - `learnings.md`: append-only cross-run memory

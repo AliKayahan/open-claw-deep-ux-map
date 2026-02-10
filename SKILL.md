@@ -22,11 +22,14 @@ Use for requests like:
 2. Infer semantic journeys from action text, icon hints, route structure, and network mutations.
 3. Capture runtime entity values (`userId`, `workspaceId`, `specificationId`, etc.) from URLs and API JSON.
 4. Resolve templated routes using captured entities and defer blocked journeys until dependencies are produced.
-5. Replay each journey in a fresh context to avoid context bloat.
-6. For destructive actions, test both modal branches (`Cancel`, then `Confirm`) when enabled.
-7. Persist cross-run memory in `artifacts/learnings.md` with file-lock-safe append logic.
-8. Emit per-journey completion updates with name, depth, start, and end (stdout + `artifacts/journey-progress.jsonl`).
-9. Output structured maps for journey analysis and test generation.
+5. Use LLM-first planning (Anthropic) with strict schema validation and heuristic fallback on failure.
+6. Execute form episodes (field fill + submit) to unlock downstream actions.
+7. Detect and satisfy gates (counts, min-fields, wizard steps, required selections).
+8. Replay each journey in a fresh context to avoid context bloat.
+9. For destructive actions, test both modal branches (`Cancel`, then `Confirm`) when enabled.
+10. Persist cross-run memory in `artifacts/learnings.md` with file-lock-safe append logic.
+11. Emit per-journey completion updates with name, depth, start, end, milestones, and gate stats.
+12. Output structured maps for journey analysis and test generation.
 
 ## Execution steps
 
@@ -43,6 +46,9 @@ Use for requests like:
 - `mapping.concurrency`: number of fresh-context journey workers
 - `contexts`: guest/auth context definitions and seeds
 - `coverage.targetPct`: target route coverage percentage
+- `planning.mode`: `llm-first` or `heuristic-fallback`
+- `llm.apiKeyEnv`: env key used to access Anthropic API
+- `gates.maxSatisfyAttempts`: loop cap when satisfying unlock requirements
 - `safety.allowDestructiveConfirm`: whether confirm branch is executed
 - `semantics.minConfidence`: threshold for accepting semantic candidates
 
@@ -54,6 +60,10 @@ Use for requests like:
 - `artifacts/entity-registry.json`
 - `artifacts/e2e-specs.json`
 - `artifacts/smoke-suite.json`
+- `artifacts/llm-decisions.jsonl`
+- `artifacts/form-ledger.jsonl`
+- `artifacts/gate-ledger.jsonl`
+- `artifacts/journey-milestones.jsonl`
 - `artifacts/expected-vs-found.md`
 - `artifacts/learnings.md`
 
